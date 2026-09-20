@@ -3,7 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -93,20 +93,24 @@ class RemoveQrTests(unittest.TestCase):
         frame = make_frame()
         box = add_qr(frame, 214, 45)
         original = frame.copy()
-        subtractor = Mock()
-        subtractor.apply.return_value = np.zeros(frame.shape[:2], dtype=np.uint8)
-        with patch.object(video2pdfslides, "get_frames", return_value=[(2, 4, frame)]), \
-                patch.object(video2pdfslides.cv2, "createBackgroundSubtractorMOG2", return_value=subtractor), \
-                patch.object(video2pdfslides.imutils, "resize", side_effect=lambda image, width: image), \
+        expected = video2pdfslides.remove_qr_codes(frame)
+        expected_resized = video2pdfslides.imutils.resize(expected, width=600)
+        with patch.object(video2pdfslides, "get_frames", return_value=[(1, 0, frame)]), \
+                patch.object(video2pdfslides.imutils, "resize", wraps=video2pdfslides.imutils.resize) as resize, \
+                patch.object(video2pdfslides.cv2, "cvtColor", wraps=video2pdfslides.cv2.cvtColor) as grayscale, \
                 patch.object(video2pdfslides.cv2, "imwrite", return_value=True) as save:
             video2pdfslides.detect_unique_screenshots(
                 "sample.mp4", "unused-output", remove_qr=True
             )
-        subtractor.apply.assert_called_once()
+        resize.assert_called_once()
+        grayscale.assert_called_once()
         save.assert_called_once()
-        detected_frame = subtractor.apply.call_args.args[0]
+        detected_frame = resize.call_args.args[0]
         saved_frame = save.call_args.args[1]
         self.assert_only_qr_regions_changed(original, detected_frame, [box])
+        np.testing.assert_array_equal(detected_frame, expected)
+        np.testing.assert_array_equal(grayscale.call_args.args[0], expected_resized)
+        self.assertEqual(grayscale.call_args.args[1], cv2.COLOR_BGR2GRAY)
         np.testing.assert_array_equal(saved_frame, detected_frame)
         np.testing.assert_array_equal(frame, original)
 

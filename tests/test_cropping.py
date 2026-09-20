@@ -3,7 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pikepdf
@@ -39,20 +39,20 @@ class CropFrameTests(unittest.TestCase):
         frame = np.arange(10 * 6 * 3, dtype=np.uint8).reshape(10, 6, 3)
         original = frame.copy()
         expected = original[2:7]
-        subtractor = Mock()
-        subtractor.apply.return_value = np.zeros((5, 6), dtype=np.uint8)
-        with patch.object(video2pdfslides, "get_frames", return_value=[(2, 4, frame)]), \
-                patch.object(video2pdfslides.cv2, "createBackgroundSubtractorMOG2", return_value=subtractor), \
-                patch.object(video2pdfslides.imutils, "resize", side_effect=lambda image, width: image) as resize, \
+        expected_resized = video2pdfslides.imutils.resize(expected, width=600)
+        with patch.object(video2pdfslides, "get_frames", return_value=[(1, 0, frame)]), \
+                patch.object(video2pdfslides.imutils, "resize", wraps=video2pdfslides.imutils.resize) as resize, \
+                patch.object(video2pdfslides.cv2, "cvtColor", wraps=video2pdfslides.cv2.cvtColor) as grayscale, \
                 patch.object(video2pdfslides.cv2, "imwrite", return_value=True) as save:
             video2pdfslides.detect_unique_screenshots(
                 "sample.mp4", "unused-output", crop_top=2, crop_bottom=3
             )
         resize.assert_called_once()
-        subtractor.apply.assert_called_once()
+        grayscale.assert_called_once()
         save.assert_called_once()
         np.testing.assert_array_equal(resize.call_args.args[0], expected)
-        np.testing.assert_array_equal(subtractor.apply.call_args.args[0], expected)
+        np.testing.assert_array_equal(grayscale.call_args.args[0], expected_resized)
+        self.assertEqual(grayscale.call_args.args[1], video2pdfslides.cv2.COLOR_BGR2GRAY)
         np.testing.assert_array_equal(save.call_args.args[1], expected)
         np.testing.assert_array_equal(frame, original)
 

@@ -132,5 +132,7 @@ dmypy.json
 # Generated media and local runtime
 /out/
 /output/
+/input/downloads/
 /.uv-cache/
 /.uv-python/
+/.tools/

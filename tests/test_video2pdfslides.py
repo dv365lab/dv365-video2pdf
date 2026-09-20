@@ -75,15 +75,22 @@ class FrameEndTests(unittest.TestCase):
             frames = list(islice(video2pdfslides.get_frames("video.mp4"), 6))
         self.assertEqual(len(frames), 3)
         self.assertEqual(capture.read.call_count, 3)
+        for index, (_, timestamp, _) in enumerate(frames):
+            self.assertAlmostEqual(timestamp, index / 3)
         capture.release.assert_called_once()
 
-    def test_default_sampling_interval_is_two_seconds(self):
+    def test_default_sampling_interval_is_half_a_second_with_unshifted_timestamps(self):
         capture = self.make_capture(total_frames=75, fps=25)
         with patch.object(video2pdfslides.cv2, "VideoCapture", return_value=capture):
             frames = list(islice(video2pdfslides.get_frames("video.mp4"), 10))
-        self.assertEqual(len(frames), 2)
+        self.assertEqual(len(frames), 6)
+        self.assertEqual(capture.read.call_count, 6)
+        self.assertEqual([frame_count for frame_count, _, _ in frames], list(range(1, 7)))
+        self.assertEqual([timestamp for _, timestamp, _ in frames], [0, 0.5, 1, 1.5, 2, 2.5])
         for index, call in enumerate(capture.set.call_args_list):
-            self.assertAlmostEqual(call.args[1], index * 2000)
+            self.assertEqual(call.args[0], video2pdfslides.cv2.CAP_PROP_POS_MSEC)
+            self.assertAlmostEqual(call.args[1], index * 500)
+            self.assertAlmostEqual(frames[index][1] * 1000, call.args[1])
         capture.release.assert_called_once()
 
     def test_failed_read_does_not_yield_stale_frame(self):
