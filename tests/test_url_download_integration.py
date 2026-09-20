@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -83,6 +84,66 @@ class UrlDownloadIntegrationTests(unittest.TestCase):
         with pikepdf.open(str(output) + '.pdf') as document:
             self.assertEqual(len(document.pages), 1)
         self.assertFalse(list((self.folder / 'input' / 'downloads').glob('.download-*')))
+
+    def test_real_downloader_prefers_highest_resolution_over_codec_and_extractor_preference(self):
+        real_run = subprocess.run
+        downloader = video2pdfslides.get_downloader()
+        source = (self.folder / 'sample.avi').read_bytes()
+        for audio_codec in ('none', 'opus'):
+            with self.subTest(highest_resolution_audio=audio_codec):
+                low_name = f'low-{audio_codec}.avi'
+                high_name = f'high-{audio_codec}.avi'
+                (self.folder / low_name).write_bytes(source)
+                (self.folder / high_name).write_bytes(source)
+                base_url = f'http://127.0.0.1:{self.server.server_port}'
+                # Synthetic extractor metadata controls selection; both URLs serve a valid video.
+                info = {
+                    'id': 'resolution', 'title': 'resolution', 'extractor': 'generic',
+                    'extractor_key': 'Generic', 'webpage_url': self.url,
+                    'formats': [
+                        {
+                            'format_id': 'h264-1080', 'url': f'{base_url}/{low_name}',
+                            'ext': 'avi', 'width': 1920, 'height': 1080,
+                            'vcodec': 'avc1.640028', 'acodec': 'none',
+                            'preference': 10, 'quality': 10,
+                        },
+                        {
+                            'format_id': 'vp9-2160', 'url': f'{base_url}/{high_name}',
+                            'ext': 'avi', 'width': 3840, 'height': 2160,
+                            'vcodec': 'vp9', 'acodec': audio_codec,
+                            'preference': -10, 'quality': 0,
+                        },
+                    ],
+                }
+                info_file = self.folder / f'resolution-{audio_codec}.info.json'
+                info_file.write_text(json.dumps(info), encoding='utf-8')
+                downloads = self.folder / f'downloads-{audio_codec}'
+                downloads.mkdir()
+                url_id = hashlib.sha256(self.url.encode('utf-8')).hexdigest()[:12]
+                old_download = downloads / f'Generic-resolution-{url_id}.avi'
+                old_content = b'previous lower-resolution download'
+                old_download.write_bytes(old_content)
+                calls = []
+
+                def run_with_fixture(command, **kwargs):
+                    command = command[:command.index('--')] + ['--load-info-json', str(info_file)]
+                    result = real_run(
+                        command, **kwargs, cwd=self.folder, env=self.env,
+                        capture_output=True, encoding='utf-8', errors='replace', timeout=30,
+                    )
+                    calls.append(result)
+                    return result
+
+                self.requests.clear()
+                with patch.object(video2pdfslides, 'get_downloader', return_value=downloader), \
+                        patch.object(video2pdfslides.subprocess, 'run', side_effect=run_with_fixture):
+                    downloaded = video2pdfslides.download_video(self.url, downloads)
+                self.assertEqual(len(calls), 1)
+                self.assertIn(f'/{high_name}', self.requests, calls[0].stdout + calls[0].stderr)
+                self.assertNotIn(f'/{low_name}', self.requests)
+                self.assertNotEqual(Path(downloaded), old_download)
+                self.assertEqual(old_download.read_bytes(), old_content)
+                self.assertEqual(Path(downloaded).read_bytes(), source)
 
     def test_real_downloader_rejects_playlist_live_and_upcoming_before_download(self):
         video = {

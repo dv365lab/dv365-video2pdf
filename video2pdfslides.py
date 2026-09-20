@@ -21,7 +21,7 @@ import zxingcpp
 OUTPUT_SLIDES_DIR = f"./output"
 PROJECT_DOWNLOADER = Path(__file__).resolve().parent / '.tools' / 'yt-dlp.exe'
 
-FRAME_RATE = 2                   # Sample every 0.5 seconds to retain briefly completed slides.
+FRAME_RATE = 1                   # Sample every 1 second.
 PIXEL_CHANGE_THRESHOLD = 20      # Ignore small compression/color fluctuations in the analysis image.
 STABLE_CHANGE_PERCENT = 0.4      # Tolerate small pointer movements between adjacent samples.
 PAGE_CHANGE_PERCENT = 0.1        # Persistent content change relative to the selected page.
@@ -73,11 +73,11 @@ def download_video(url, download_dir='input/downloads'):
         command = [
             downloader, '--ignore-config', '--no-cache-dir', '--no-playlist', '--playlist-items', '1',
             '--match-filters', '!is_live & !playlist & live_status!=?is_upcoming',
-            '--format', 'bv*[vcodec^=avc1]/bv*[vcodec^=h264]/bv*',
+            '--format', 'bv*', '--format-sort', 'res', '--format-sort-force',
             '--check-formats',
             '--restrict-filenames', '--windows-filenames', '--no-overwrites',
             '--paths', str(folder),
-            '--output', '%(extractor_key)s-%(id)s-' + url_id + '.%(ext)s',
+            '--output', '%(extractor_key)s-%(id)s-' + url_id + '-f%(format_id)s.%(ext)s',
             '--print-to-file', 'after_move:%(filepath)j', str(result_file).replace('%', '%%'),
             '--no-simulate', '--newline', '--encoding', 'utf-8',
             '--socket-timeout', '30', '--retries', '3', '--fragment-retries', '3',
