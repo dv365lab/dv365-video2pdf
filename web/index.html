@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="upload-token" content="__UPLOAD_TOKEN__">
+  <title>video2pdf · 视频转 PDF</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header><a class="brand" href="/">video<span>2</span>pdf</a><span class="local"><i></i> 本地运行</span></header>
+    <section class="intro"><p class="eyebrow">让视频里的知识，留在纸上</p><h1>视频拖进来，<br>幻灯片带走。</h1><p>自动提取视频中的稳定画面，整理为 PDF。<br>适合课程、幻灯片与屏幕演示。</p></section>
+    <section class="workspace" aria-label="视频转换">
+      <div class="drop-zone" id="drop-zone">
+        <div class="upload-icon" aria-hidden="true">↑</div>
+        <h2>将视频拖到这里</h2>
+        <p>支持多个视频 · MP4 / AVI / MOV / MKV 等</p>
+        <button type="button" class="secondary" id="choose">选择视频文件</button>
+        <input type="file" id="file-input" accept="video/*,.mkv,.avi,.ts,.mts,.m2ts,.flv" multiple hidden>
+        <small>文件仅传入本机服务，处理过程无需联网</small>
+      </div>
+      <form id="convert-form">
+        <div class="options-heading"><h2>处理选项</h2><span>默认保留完整画面</span></div>
+        <div class="options">
+          <label>顶部裁剪 <span>像素</span><input id="crop-top" type="number" min="0" step="1" value="0" required></label>
+          <label>底部裁剪 <span>像素</span><input id="crop-bottom" type="number" min="0" step="1" value="0" required></label>
+          <label class="checkbox"><input id="remove-qr" type="checkbox"><span>自动移除二维码<small>用附近背景色覆盖</small></span></label>
+        </div>
+        <div class="action-row"><span id="selection-count">还未添加视频</span><button type="submit" class="primary" id="convert" disabled>开始转换 <span aria-hidden="true">→</span></button></div>
+      </form>
+    </section>
+    <p id="notice" class="notice" role="status" aria-live="polite"></p>
+    <section class="queue" aria-label="任务列表"><div class="queue-heading"><h2>视频列表</h2><span id="queue-count">0 个视频</span></div><p id="empty">添加视频后，可在这里查看转换状态并下载 PDF。</p><div id="jobs"></div></section>
+    <footer>逐个处理 · 自动生成 PDF · 同名文件独立保存</footer>
+  </main>
+</body>
+</html>

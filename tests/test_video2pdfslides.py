@@ -80,13 +80,13 @@ class FrameEndTests(unittest.TestCase):
         capture.release.assert_called_once()
 
     def test_default_sampling_interval_is_one_second_with_unshifted_timestamps(self):
-        capture = self.make_capture(total_frames=75, fps=25)
+        capture = self.make_capture(total_frames=150, fps=25)
         with patch.object(video2pdfslides.cv2, "VideoCapture", return_value=capture):
             frames = list(islice(video2pdfslides.get_frames("video.mp4"), 10))
-        self.assertEqual(len(frames), 3)
-        self.assertEqual(capture.read.call_count, 3)
-        self.assertEqual([frame_count for frame_count, _, _ in frames], [1, 2, 3])
-        self.assertEqual([timestamp for _, timestamp, _ in frames], [0, 1, 2])
+        self.assertEqual(len(frames), 6)
+        self.assertEqual(capture.read.call_count, 6)
+        self.assertEqual([frame_count for frame_count, _, _ in frames], list(range(1, 7)))
+        self.assertEqual([timestamp for _, timestamp, _ in frames], [0, 1, 2, 3, 4, 5])
         for index, call in enumerate(capture.set.call_args_list):
             self.assertEqual(call.args[0], video2pdfslides.cv2.CAP_PROP_POS_MSEC)
             self.assertAlmostEqual(call.args[1], index * 1000)
@@ -113,6 +113,18 @@ class FrameEndTests(unittest.TestCase):
 
 
 class OutputPathTests(unittest.TestCase):
+    def test_pdf_handles_literal_brackets_in_screenshot_path_and_preserves_order(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
+            screenshots = Path(temp) / "国内怎么才能用上Opus5.5 [6u5TQ3UscDo]_noqr"
+            screenshots.mkdir()
+            Image.new("RGB", (64, 36), "white").save(screenshots / "0001_0.2.png")
+            Image.new("RGB", (32, 18), "white").save(screenshots / "0000_0.1.png")
+            video2pdfslides.convert_screenshots_to_pdf(str(screenshots))
+            with pikepdf.open(str(screenshots) + ".pdf") as document:
+                self.assertEqual(len(document.pages), 2)
+                images = [next(iter(page.images.values())) for page in document.pages]
+                self.assertEqual([(image.Width, image.Height) for image in images], [(32, 18), (64, 36)])
+
     def test_output_folder_uses_full_video_stem(self):
         cases = [
             (r"F:\Download\01-chapt1\1.1.mp4", "1.1"),

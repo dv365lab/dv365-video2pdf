@@ -4,7 +4,6 @@ import cv2
 import imutils
 import shutil
 import img2pdf
-import glob
 import argparse
 import hashlib
 import json
@@ -21,19 +20,22 @@ import zxingcpp
 OUTPUT_SLIDES_DIR = f"./output"
 PROJECT_DOWNLOADER = Path(__file__).resolve().parent / '.tools' / 'yt-dlp.exe'
 
-FRAME_RATE = 1                   # Sample every 1 second.
+FRAME_RATE = 1                   # Sample every 1 second to retain briefly completed slides.
 PIXEL_CHANGE_THRESHOLD = 20      # Ignore small compression/color fluctuations in the analysis image.
 STABLE_CHANGE_PERCENT = 0.4      # Tolerate small pointer movements between adjacent samples.
 PAGE_CHANGE_PERCENT = 0.1        # Persistent content change relative to the selected page.
 SCENE_CHANGE_PERCENT = 3         # Preserve the preceding frame before a large transition.
 
 
-def resolve_video_source(source):
+def resolve_video_source(source, referer=None, cookies_from_browser=None, add_headers=None):
     '''Download HTTP(S) video links; leave local paths unchanged.'''
     if source.lower().startswith(('http://', 'https://')):
         if not urlsplit(source).hostname:
             raise ValueError('视频网址无效，请输入完整的 http:// 或 https:// 网址。')
-        return download_video(source)
+        return download_video(
+            source, referer=referer,
+            cookies_from_browser=cookies_from_browser, add_headers=add_headers,
+        )
     if '://' in source:
         raise ValueError('仅支持 http:// 或 https:// 视频网址。')
     return source
@@ -59,28 +61,74 @@ def get_downloader():
     return downloader
 
 
-def download_video(url, download_dir='input/downloads'):
+VIDYARD_REFERER = 'https://play.vidyard.com/'
+
+
+def default_referer(url):
+    '''Vidyard CDN streams return HTTP 403 without a Referer header.'''
+    host = (urlsplit(url).hostname or '').lower()
+    if host == 'vidyard.com' or host.endswith('.vidyard.com'):
+        return VIDYARD_REFERER
+    return None
+
+
+def upgrade_vidyard_master(url):
+    '''A Vidyard variant playlist (index-*.m3u8) locks to one quality; the sibling
+    master.m3u8 lists every resolution so best-quality selection can reach 1080p.'''
+    parts = urlsplit(url)
+    host = (parts.hostname or '').lower()
+    if not (host == 'vidyard.com' or host.endswith('.vidyard.com')):
+        return url
+    if '.urlset/' not in parts.path:
+        return url
+    directory, sep, last = parts.path.rpartition('/')
+    if not sep or last == 'master.m3u8' or not last.endswith('.m3u8'):
+        return url
+    return parts._replace(path=f'{directory}/master.m3u8').geturl()
+
+
+def download_video(url, download_dir='input/downloads', referer=None, cookies_from_browser=None, add_headers=None):
     '''Use the external yt-dlp command without changing the project Python environment.'''
     downloader = get_downloader()
+
+    upgraded = upgrade_vidyard_master(url)
+    if upgraded != url:
+        print('已切换到 Vidyard 主播放列表以获取最高清晰度:', upgraded, flush=True)
+        url = upgraded
+
+    if referer is None:
+        referer = default_referer(url)
 
     folder = Path(download_dir).resolve()
     folder.mkdir(parents=True, exist_ok=True)
     url_id = hashlib.sha256(url.encode('utf-8')).hexdigest()[:12]
     print('下载工具:', downloader, flush=True)
+    if referer:
+        print('使用 Referer:', referer, flush=True)
+    if cookies_from_browser:
+        print('使用浏览器 Cookie:', cookies_from_browser, flush=True)
     print('正在下载视频，保存目录:', folder, flush=True)
     with tempfile.TemporaryDirectory(prefix='.download-', dir=folder) as temp:
         result_file = Path(temp) / 'video-path.jsonl'
+        options = []
+        if referer:
+            options += ['--referer', referer]
+        if cookies_from_browser:
+            options += ['--cookies-from-browser', cookies_from_browser]
+        for header in add_headers or []:
+            options += ['--add-header', header]
         command = [
             downloader, '--ignore-config', '--no-cache-dir', '--no-playlist', '--playlist-items', '1',
             '--match-filters', '!is_live & !playlist & live_status!=?is_upcoming',
-            '--format', 'bv*', '--format-sort', 'res', '--format-sort-force',
+            '--format', 'bv*[vcodec^=avc1]/bv*[vcodec^=h264]/bv*',
             '--check-formats',
             '--restrict-filenames', '--windows-filenames', '--no-overwrites',
             '--paths', str(folder),
-            '--output', '%(extractor_key)s-%(id)s-' + url_id + '-f%(format_id)s.%(ext)s',
+            '--output', '%(extractor_key)s-%(id)s-' + url_id + '.%(ext)s',
             '--print-to-file', 'after_move:%(filepath)j', str(result_file).replace('%', '%%'),
             '--no-simulate', '--newline', '--encoding', 'utf-8',
             '--socket-timeout', '30', '--retries', '3', '--fragment-retries', '3',
+            *options,
             '--', url,
         ]
         try:
@@ -274,7 +322,7 @@ def convert_screenshots_to_pdf(output_folder_screenshot_path):
     print('output_pdf_path', output_pdf_path)
     print('converting images to pdf..')
     with open(output_pdf_path, "wb") as f:
-        f.write(img2pdf.convert(sorted(glob.glob(f"{output_folder_screenshot_path}/*.png"))))
+        f.write(img2pdf.convert([str(path) for path in sorted(Path(output_folder_screenshot_path).glob("*.png"))]))
     print('Pdf Created!')
     print('pdf saved at', output_pdf_path)
 
@@ -292,9 +340,15 @@ if __name__ == "__main__":
     parser.add_argument("--crop-top", type=int, default=0, metavar="PIXELS", help="crop this many pixels from the top before detection and saving")
     parser.add_argument("--crop-bottom", type=int, default=0, metavar="PIXELS", help="crop this many pixels from the bottom before detection and saving")
     parser.add_argument("--remove-qr", action="store_true", help="detect QR codes and cover them with nearby background colors")
+    parser.add_argument("--referer", type=str, default=None, metavar="URL", help="Referer header for the downloader (auto-set for Vidyard URLs)")
+    parser.add_argument("--cookies-from-browser", type=str, default=None, metavar="BROWSER", help="use cookies from this browser for login-gated URLs, e.g. chrome, edge, firefox")
+    parser.add_argument("--add-header", action="append", default=None, metavar="NAME:VALUE", help="extra HTTP header for the downloader; may be repeated")
     args = parser.parse_args()
     try:
-        video_path = resolve_video_source(args.video_path)
+        video_path = resolve_video_source(
+            args.video_path, referer=args.referer,
+            cookies_from_browser=args.cookies_from_browser, add_headers=args.add_header,
+        )
     except ValueError as error:
         parser.error(str(error))
     except (RuntimeError, OSError) as error:

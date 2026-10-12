@@ -20,7 +20,7 @@ class VideoUrlTests(unittest.TestCase):
         for source in ("https://www.youtube.com/watch?v=example&list=123", "HTTP://example.com/video.mp4"):
             with self.subTest(source=source), patch.object(video2pdfslides, "download_video", return_value="input/downloads/sample.mp4") as download:
                 self.assertEqual(video2pdfslides.resolve_video_source(source), "input/downloads/sample.mp4")
-                download.assert_called_once_with(source)
+                download.assert_called_once_with(source, referer=None, cookies_from_browser=None, add_headers=None)
 
     def test_invalid_urls_fail_without_downloading(self):
         for source in ("https://", "https:///video.mp4", "ftp://example.com/video.mp4"):
