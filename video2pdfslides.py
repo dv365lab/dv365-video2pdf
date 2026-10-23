@@ -7,13 +7,17 @@ import img2pdf
 import argparse
 import hashlib
 import json
+import math
 import re
 import subprocess
 import tempfile
+import unicodedata
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 import numpy as np
 import zxingcpp
+from PIL import Image
 
 ############# Define constants
 
@@ -219,6 +223,126 @@ def remove_qr_codes(frame):
     return cleaned
 
 
+BRANDING_TEXT = re.compile(
+    r'半导体教育领航者|(?:https?://)?(?:www\.)?eeeknow\.com(?:\(移知\))?|\(?移知\)?'
+)
+
+
+def normalize_branding_text(text):
+    return ''.join(unicodedata.normalize('NFKC', text).casefold().split())
+
+
+@lru_cache(maxsize=1)
+def get_text_ocr():
+    '''Load the bundled Chinese/English OCR models once, without online services.'''
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError as error:
+        raise RuntimeError('缺少文字识别依赖，请先安装 requirements.txt 中的依赖。') from error
+    # Higher detection resolution also finds the small cyan lettering on dark covers.
+    return RapidOCR(intra_op_num_threads=2, inter_op_num_threads=1, det_limit_side_len=1080)
+
+
+@lru_cache(maxsize=1)
+def get_branding_logo_template():
+    '''Binary shape taken from the supplied cyan interlocking-square logo.'''
+    path = Path(__file__).resolve().parent / 'assets' / 'eeeknow-logo-mask.png'
+    return cv2.imdecode(np.frombuffer(path.read_bytes(), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+
+
+def remove_corner_branding(frame):
+    '''Locate the known corner logo, then cover its entire logo/name/date block.'''
+    height, width = frame.shape[:2]
+    left, top = int(width * 0.7), int(height * 0.75)
+    hsv = cv2.cvtColor(frame[top:, left:], cv2.COLOR_BGR2HSV)
+    cyan = cv2.inRange(hsv, np.array([80, 90, 75]), np.array([105, 255, 255]))
+    if np.count_nonzero(cyan) < 40:
+        return frame
+    template = get_branding_logo_template()
+    # Padding permits a slightly cropped logo at the bottom/right video edges.
+    cyan = cv2.copyMakeBorder(cyan, 0, max(1, round(height * 0.05)),
+                             0, max(1, round(width * 0.01)), cv2.BORDER_CONSTANT, value=0)
+    step = max(1, round(width / 640))
+    best_score, best_box = 0.78, None
+    for logo_width in range(max(12, int(width * 0.015)) // step * step, round(width * 0.1) + 1, step):
+        logo_height = round(logo_width * template.shape[0] / template.shape[1])
+        if logo_height > cyan.shape[0] or logo_width > cyan.shape[1]:
+            continue
+        scaled = cv2.resize(template, (logo_width, logo_height), interpolation=cv2.INTER_AREA)
+        scores = cv2.matchTemplate(cyan, scaled, cv2.TM_CCOEFF_NORMED)
+        # The reference mark has its name to the right and date directly below.
+        # Require this corner layout; a cyan shape elsewhere must not erase a page.
+        x1, y1 = max(0, round(width - 3.6 * logo_width) - left), max(0, round(height - 1.6 * logo_height) - top)
+        x2 = min(scores.shape[1], round(width - 0.7 * logo_width) - left + 1)
+        y2 = min(scores.shape[0], round(height - 0.55 * logo_height) - top + 1)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        _, score, _, position = cv2.minMaxLoc(scores[y1:y2, x1:x2])
+        px, py = x1 + position[0], y1 + position[1]
+        visible_width = min(logo_width, width - left - px)
+        visible_height = min(logo_height, height - top - py)
+        if visible_width < logo_width or visible_height < logo_height:
+            # A crop removes pixels, not shape evidence. Score only the visible
+            # portion instead of treating the missing strip as a black mismatch.
+            visible = cyan[py:py + visible_height, px:px + visible_width]
+            score = float(cv2.matchTemplate(visible, scaled[:visible_height, :visible_width], cv2.TM_CCOEFF_NORMED)[0, 0])
+        if score > best_score:
+            best_score = score
+            best_box = (left + px, top + py, logo_height)
+    if best_box is None:
+        return frame
+    x, y, logo_height = best_box
+    margin = max(3, round(logo_height * 0.08))
+    x, y = max(0, x - margin), max(0, y - margin)
+    background = np.concatenate([
+        frame[max(0, y - margin):y, x:].reshape(-1, 3),
+        frame[y:, max(0, x - margin):x].reshape(-1, 3),
+    ])
+    if not len(background):
+        return frame
+    cleaned = frame.copy()
+    cleaned[y:, x:] = np.median(background, axis=0).astype(frame.dtype)
+    return cleaned
+
+
+def remove_branding_text(frame):
+    '''Clean the known corner mark and recognized branding text in PDF images.'''
+    frame = remove_corner_branding(frame)
+    results, _ = get_text_ocr()(frame, return_word_box=True, text_score=0.6)
+    polygons = []
+    for row in results or []:
+        box, text, confidence = row[:3]
+        normalized = normalize_branding_text(text)
+        if confidence < 0.6 or not BRANDING_TEXT.search(normalized):
+            continue
+        if BRANDING_TEXT.fullmatch(normalized):
+            polygons.append(np.rint(box).astype(np.int32))
+        elif len(row) >= 5 and len(row[3]) == len(row[4]):
+            # OCR can merge branding and body text into one line. Use actual
+            # character coordinates rather than covering the entire line.
+            characters, boxes = [], []
+            for char_box, token in zip(row[3], row[4]):
+                token = normalize_branding_text(token)
+                characters.extend(token)
+                boxes.extend([char_box] * len(token))
+            for match in BRANDING_TEXT.finditer(''.join(characters)):
+                points = np.rint(boxes[match.start():match.end()]).astype(np.int32)
+                polygons.append(cv2.convexHull(points.reshape(-1, 2)))
+    if not polygons:
+        return frame
+
+    cleaned = frame.copy()
+    kernel = np.ones((7, 7), dtype=np.uint8)
+    for polygon in polygons:
+        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        cv2.fillConvexPoly(mask, polygon, 255)
+        mask = cv2.dilate(mask, kernel)  # Include antialiasing around the text.
+        ring = (cv2.dilate(mask, kernel) != 0) & (mask == 0)
+        if np.any(ring):
+            cleaned[mask != 0] = np.median(frame[ring], axis=0).astype(frame.dtype)
+    return cleaned
+
+
 def detect_unique_screenshots(video_path, output_folder_screenshot_path, crop_top=0, crop_bottom=0, remove_qr=False):
     '''Select stable content changes, retaining short pages and final animation states.'''
     start_time = time.time()
@@ -321,8 +445,27 @@ def convert_screenshots_to_pdf(output_folder_screenshot_path):
     print('output_folder_screenshot_path', output_folder_screenshot_path)
     print('output_pdf_path', output_pdf_path)
     print('converting images to pdf..')
-    with open(output_pdf_path, "wb") as f:
-        f.write(img2pdf.convert([str(path) for path in sorted(Path(output_folder_screenshot_path).glob("*.png"))]))
+    screenshots = sorted(Path(output_folder_screenshot_path).glob('*.png'))
+    # Keep the review PNGs intact. Only cleaned copies are embedded in the PDF,
+    # so rebuilding a PDF from existing screenshots also removes branding.
+    with tempfile.TemporaryDirectory(prefix='video2pdf-text-') as temp:
+        pdf_images = []
+        for index, path in enumerate(screenshots):
+            print(f'清理 PDF 品牌标记 {index + 1}/{len(screenshots)}: {path.name}', flush=True)
+            with Image.open(path) as source:
+                frame = np.ascontiguousarray(np.asarray(source.convert('RGB'))[:, :, ::-1])
+                cleaned = remove_branding_text(frame)
+                if cleaned is not frame:
+                    cleaned_path = Path(temp) / f'{index:06}.png'
+                    options = {'dpi': source.info['dpi']} if 'dpi' in source.info else {}
+                    Image.fromarray(cleaned[:, :, ::-1]).save(cleaned_path, **options)
+                    pdf_images.append(str(cleaned_path))
+                else:
+                    pdf_images.append(str(path))
+        # Do not truncate an existing PDF if OCR or image conversion fails.
+        pdf_bytes = img2pdf.convert(pdf_images)
+        with open(output_pdf_path, "wb") as f:
+            f.write(pdf_bytes)
     print('Pdf Created!')
     print('pdf saved at', output_pdf_path)
 
@@ -337,6 +480,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser("video_path")
     parser.add_argument("video_path", help="local video path or HTTP(S) video URL to convert to PDF slides", type=str)
     parser.add_argument("--review", action="store_true", help="pause to review screenshots before creating the PDF")
+    parser.add_argument('--extract-only', action='store_true', help='save PNG screenshots without creating a PDF')
+    parser.add_argument('--sample-interval', type=float, default=1 / FRAME_RATE, metavar='SECONDS', help='seconds between sampled frames (default: 1)')
     parser.add_argument("--crop-top", type=int, default=0, metavar="PIXELS", help="crop this many pixels from the top before detection and saving")
     parser.add_argument("--crop-bottom", type=int, default=0, metavar="PIXELS", help="crop this many pixels from the bottom before detection and saving")
     parser.add_argument("--remove-qr", action="store_true", help="detect QR codes and cover them with nearby background colors")
@@ -344,6 +489,11 @@ if __name__ == "__main__":
     parser.add_argument("--cookies-from-browser", type=str, default=None, metavar="BROWSER", help="use cookies from this browser for login-gated URLs, e.g. chrome, edge, firefox")
     parser.add_argument("--add-header", action="append", default=None, metavar="NAME:VALUE", help="extra HTTP header for the downloader; may be repeated")
     args = parser.parse_args()
+    if not math.isfinite(args.sample_interval) or args.sample_interval <= 0:
+        parser.error('sample interval must be a positive finite number')
+    if args.review and args.extract_only:
+        parser.error('--review and --extract-only cannot be used together')
+    FRAME_RATE = 1 / args.sample_interval
     try:
         video_path = resolve_video_source(
             args.video_path, referer=args.referer,
@@ -384,5 +534,5 @@ if __name__ == "__main__":
             else:
                 print('please enter a valid choice')
 
-    if choice == 'y':
+    if choice == 'y' and not args.extract_only:
         convert_screenshots_to_pdf(output_folder_screenshot_path)

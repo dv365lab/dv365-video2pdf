@@ -14,7 +14,7 @@ import video2pdfslides
 
 
 class CliCompletionTests(unittest.TestCase):
-    def run_conversion(self, review_answer=None):
+    def run_conversion(self, review_answer=None, extra_args=(), pdf_expected=True):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
             folder = Path(temp).resolve()
             video = folder / "sample.1.avi"
@@ -29,6 +29,7 @@ class CliCompletionTests(unittest.TestCase):
             finally:
                 writer.release()
             command = [sys.executable, str(Path(video2pdfslides.__file__).resolve()), str(video)]
+            command.extend(extra_args)
             if review_answer is not None:
                 command.append("--review")
             result = subprocess.run(
@@ -38,7 +39,7 @@ class CliCompletionTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(len(list((folder / "output" / "sample.1").glob("*.png"))), 1)
             pdf = folder / "output" / "sample.1.pdf"
-            if review_answer == "n\n":
+            if review_answer == "n\n" or not pdf_expected:
                 self.assertFalse(pdf.exists())
             else:
                 self.assertTrue(pdf.is_file())
@@ -46,6 +47,7 @@ class CliCompletionTests(unittest.TestCase):
                     self.assertEqual(len(document.pages), 1)
             if review_answer is None:
                 self.assertNotIn("Press y", result.stdout)
+            return result
 
     def test_default_run_generates_pdf_without_input(self):
         self.run_conversion()
@@ -55,6 +57,19 @@ class CliCompletionTests(unittest.TestCase):
 
     def test_review_no_preserves_screenshots_without_pdf(self):
         self.run_conversion("n\n")
+
+    def test_extract_only_and_custom_sampling_interval(self):
+        result = self.run_conversion(extra_args=['--extract-only', '--sample-interval', '2'], pdf_expected=False)
+        self.assertIn('FRAME_RATE 0.5', result.stdout)
+
+    def test_invalid_sampling_and_conflicting_modes_fail_before_reading_video(self):
+        for options in [['--sample-interval', value] for value in ['0', '-1', 'nan', 'inf']] + [['--review', '--extract-only']]:
+            with self.subTest(options=options):
+                result = subprocess.run([sys.executable, str(Path(video2pdfslides.__file__).resolve()), 'missing.mp4', *options],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('unable to open file', result.stderr)
+                self.assertIn('error:', result.stderr)
 
 
 class FrameEndTests(unittest.TestCase):

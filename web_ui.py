@@ -2,8 +2,11 @@
 
 import argparse
 import json
+import math
+import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -18,6 +21,54 @@ from urllib.parse import parse_qs, quote, urlsplit
 PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = PROJECT_ROOT / "web"
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v", ".wmv", ".mpg", ".mpeg", ".ts", ".mts", ".m2ts", ".flv"}
+
+
+def open_folder(path):
+    path = Path(path).resolve()
+    if not path.is_dir():
+        raise OSError('文件夹不存在。')
+    if os.name == 'nt':
+        os.startfile(str(path))
+    else:
+        subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', str(path)])
+
+
+def http_url(value):
+    parts = urlsplit(value)
+    return parts.scheme in ('http', 'https') and bool(parts.hostname)
+
+
+def parse_options(values):
+    if not isinstance(values, dict):
+        raise ValueError('处理选项无效。')
+    top, bottom = int(str(values.get('crop_top', 0))), int(str(values.get('crop_bottom', 0)))
+    interval = float(values.get('sample_interval', 1))
+    if top < 0 or bottom < 0:
+        raise ValueError('裁剪像素必须是非负整数。')
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError('采样间隔必须是大于 0 的有限秒数。')
+    qr = str(values.get('remove_qr', False)).lower()
+    mode = values.get('mode', 'auto')
+    if qr not in ('true', 'false') or mode not in ('auto', 'review', 'png'):
+        raise ValueError('二维码或输出方式选项无效。')
+    referer = values.get('referer', '')
+    cookies = values.get('cookies_from_browser', '')
+    if not isinstance(referer, str) or not isinstance(cookies, str):
+        raise ValueError('下载设置必须为文本。')
+    referer, cookies = referer.strip(), cookies.strip()
+    headers = values.get('add_headers', [])
+    if referer and (not http_url(referer) or '\n' in referer or '\r' in referer):
+        raise ValueError('Referer 必须是完整的 HTTP(S) 网址。')
+    if '\n' in cookies or '\r' in cookies or cookies.startswith('-'):
+        raise ValueError('浏览器 Cookie 来源无效。')
+    if not isinstance(headers, list) or any(
+        not isinstance(header, str) or not re.match(r'^[A-Za-z0-9-]+:', header)
+        or '\n' in header or '\r' in header for header in headers
+    ):
+        raise ValueError('请求头请按每行“名称:值”填写。')
+    return dict(crop_top=top, crop_bottom=bottom, sample_interval=interval,
+                remove_qr=qr == 'true', mode=mode, referer=referer,
+                cookies_from_browser=cookies, add_headers=headers)
 
 
 class WebServer(ThreadingHTTPServer):
@@ -41,33 +92,100 @@ class WebServer(ThreadingHTTPServer):
             job = self.jobs.get(job_id)
             return dict(job) if job else None
 
-    def convert(self, job_id, source, crop_top, crop_bottom, remove_qr):
-        self.update(job_id, status="running")
+    def add_job(self, filename, kind='video', job_id=None):
+        job_id = job_id or uuid.uuid4().hex
+        (self.work_root / job_id).mkdir(exist_ok=True)
+        job = dict(id=job_id, filename=filename, kind=kind, status='queued', log='',
+                   pages=None, download_url=None, screenshots_path=None)
+        with self.lock:
+            self.jobs[job_id] = job
+        return job_id
+
+    def run_command(self, job_id, command, cwd):
+        self.update(job_id, status='running')
+        log = self.snapshot(job_id)['log']
+        with subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              encoding='utf-8', errors='replace') as process:
+            for line in process.stdout:
+                log = (log + line)[-16000:]
+                self.update(job_id, log=log)
+            if process.wait() != 0:
+                raise RuntimeError('处理失败，请查看上方日志。')
+
+    def fail_job(self, job_id, error):
+        self.update(job_id, status='error', log=(self.snapshot(job_id)['log'] + '\n' + str(error))[-16000:])
+
+    def finish_pdf(self, job_id):
+        pdfs = list((self.work_root / job_id / 'output').glob('*.pdf'))
+        if len(pdfs) != 1 or not pdfs[0].stat().st_size:
+            raise ValueError('未生成 PDF，请检查视频或截图。')
+        folder = pdfs[0].with_suffix('')
+        self.update(job_id, status='done', pages=len(list(folder.glob('*.png'))),
+                    screenshots_path=str(folder), download_url=f'/api/jobs/{job_id}/pdf')
+
+    def convert(self, job_id, source, options):
         command = [
             sys.executable, "-X", "utf8", "-u", str(PROJECT_ROOT / "video2pdfslides.py"),
-            str(source), "--crop-top", str(crop_top), "--crop-bottom", str(crop_bottom),
+            str(source), '--crop-top', str(options['crop_top']), '--crop-bottom', str(options['crop_bottom']),
+            '--sample-interval', str(options['sample_interval']),
         ]
-        if remove_qr:
+        if options['remove_qr']:
             command.append("--remove-qr")
-        log = ""
+        if options['mode'] != 'auto':
+            command.append('--extract-only')
+        for key, flag in [('referer', '--referer'), ('cookies_from_browser', '--cookies-from-browser')]:
+            if options[key]:
+                command.extend([flag, options[key]])
+        for header in options['add_headers']:
+            command.extend(['--add-header', header])
         try:
-            with subprocess.Popen(
-                command, cwd=source.parent, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                encoding="utf-8", errors="replace",
-            ) as process:
-                for line in process.stdout:
-                    log = (log + line)[-16000:]
-                    self.update(job_id, log=log)
-                return_code = process.wait()
-            pdfs = list((source.parent / "output").glob("*.pdf"))
-            if return_code != 0 or len(pdfs) != 1 or not pdfs[0].stat().st_size:
-                self.update(job_id, status="error", log=log or "转换失败，请检查视频文件。")
-                return
-            pages = len(list(pdfs[0].with_suffix("").glob("*.png")))
-            self.update(job_id, status="done", pages=pages, download_url=f"/api/jobs/{job_id}/pdf")
+            self.run_command(job_id, command, self.work_root / job_id)
+            if options['mode'] == 'auto':
+                self.finish_pdf(job_id)
+            else:
+                folders = [p for p in (self.work_root / job_id / 'output').iterdir() if p.is_dir() and any(p.glob('*.png'))]
+                if len(folders) != 1:
+                    raise ValueError('没有可供检查的 PNG 截图。')
+                self.update(job_id, status='review' if options['mode'] == 'review' else 'screenshots',
+                            screenshots_path=str(folders[0]), pages=len(list(folders[0].glob('*.png'))))
         except Exception as error:
-            self.update(job_id, status="error", log=(log + "\n" + str(error))[-16000:])
+            self.fail_job(job_id, error)
+
+    def compose(self, job_id):
+        folder = self.snapshot(job_id)['screenshots_path']
+        command = [sys.executable, '-X', 'utf8', '-u', '-c',
+                   'import sys; sys.path.insert(0, sys.argv[1]); '
+                   'from video2pdfslides import convert_screenshots_to_pdf; convert_screenshots_to_pdf(sys.argv[2])',
+                   str(PROJECT_ROOT), folder]
+        try:
+            self.run_command(job_id, command, self.work_root / job_id)
+            self.finish_pdf(job_id)
+        except Exception as error:
+            self.fail_job(job_id, error)
+
+    def import_screenshots(self, job_id, source, mode):
+        try:
+            self.update(job_id, status='running')
+            folder = self.work_root / job_id / 'output' / (source.name or 'screenshots')
+            folder.mkdir(parents=True)
+            files = sorted(source.glob('*.png'))
+            for path in files:
+                shutil.copy2(path, folder / path.name)
+            self.update(job_id, screenshots_path=str(folder), pages=len(files))
+            if mode in ('review', 'png'):
+                self.update(job_id, status='review' if mode == 'review' else 'screenshots')
+            else:
+                self.compose(job_id)
+        except Exception as error:
+            self.fail_job(job_id, error)
+
+    def setup_downloader(self, job_id):
+        try:
+            self.run_command(job_id, [sys.executable, '-X', 'utf8', '-u', str(PROJECT_ROOT / 'setup_downloader.py')], PROJECT_ROOT)
+            self.update(job_id, status='done')
+        except Exception as error:
+            self.fail_job(job_id, error)
 
     def server_close(self):
         super().server_close()
@@ -102,6 +220,15 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def send_json(self, status, value):
         self.send_bytes(status, json.dumps(value, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+
+    def read_json(self):
+        length = int(self.headers.get('Content-Length', '0'))
+        if not 0 < length <= 65536 or self.headers.get('Transfer-Encoding'):
+            raise ValueError('请求内容长度无效。')
+        value = json.loads(self.rfile.read(length))
+        if not isinstance(value, dict):
+            raise ValueError('请求内容必须是 JSON 对象。')
+        return value
 
     def do_GET(self):
         if not self.allowed_request():
@@ -147,7 +274,17 @@ class RequestHandler(BaseHTTPRequestHandler):
         if self.headers.get("X-Upload-Token") != self.server.upload_token:
             self.send_json(403, {"error": "请从本机页面添加视频。"})
             return
-        if urlsplit(self.path).path != "/api/jobs":
+        path = urlsplit(self.path).path
+        if path != '/api/jobs':
+            try:
+                if self.handle_action(path):
+                    return
+            except (ValueError, TypeError) as error:
+                self.send_json(400, {'error': str(error)})
+                return
+            except OSError as error:
+                self.send_json(500, {'error': f'无法打开或读取文件夹：{error}'})
+                return
             self.send_json(404, {"error": "接口不存在。"})
             return
         try:
@@ -159,13 +296,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 raise ValueError("视频文件名无效，请重命名后重试。")
             if Path(filename).suffix.lower() not in VIDEO_EXTENSIONS:
                 raise ValueError("请选择 MP4、AVI、MOV、MKV 等视频文件。")
-            crop_top = int(query.get("crop_top", ["0"])[0])
-            crop_bottom = int(query.get("crop_bottom", ["0"])[0])
-            if crop_top < 0 or crop_bottom < 0:
-                raise ValueError("裁剪像素必须是非负整数。")
-            remove_qr = query.get("remove_qr", ["false"])[0]
-            if remove_qr not in ("true", "false"):
-                raise ValueError("去二维码选项无效。")
+            options = parse_options({key: value[0] for key, value in query.items()})
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0 or self.headers.get("Transfer-Encoding"):
                 raise ValueError("视频文件为空，或上传长度无效。")
@@ -192,11 +323,78 @@ class RequestHandler(BaseHTTPRequestHandler):
             folder.rmdir()
             self.send_json(400, {"error": str(error)})
             return
-        job = {"id": job_id, "filename": filename, "status": "queued", "log": "", "pages": None, "download_url": None}
-        with self.server.lock:
-            self.server.jobs[job_id] = job
-        self.server.executor.submit(self.server.convert, job_id, source, crop_top, crop_bottom, remove_qr == "true")
+        self.server.add_job(filename, job_id=job_id)
+        self.server.executor.submit(self.server.convert, job_id, source, options)
         self.send_json(202, self.server.snapshot(job_id))
+
+    def handle_action(self, path):
+        if path == '/api/output/open':
+            folder = PROJECT_ROOT / 'output'
+            folder.mkdir(exist_ok=True)
+            open_folder(folder)
+            self.send_json(200, {'path': str(folder)})
+        elif path == '/api/downloader':
+            job_id = self.server.add_job('安装 / 更新视频下载器', 'downloader')
+            self.server.executor.submit(self.server.setup_downloader, job_id)
+            self.send_json(202, self.server.snapshot(job_id))
+        elif path == '/api/sources':
+            payload = self.read_json()
+            kind, source = payload.get('kind'), payload.get('source')
+            if not isinstance(source, str) or not source.strip():
+                raise ValueError('请填写视频网址、本地视频路径或 PNG 文件夹。')
+            source = source.strip().strip('"')
+            options = parse_options(payload.get('options', {}))
+            if kind == 'url':
+                if not http_url(source):
+                    raise ValueError('请输入完整的 HTTP(S) 视频网址。')
+                filename = source
+            elif kind in ('local', 'screenshots'):
+                source = Path(source).expanduser()
+                if not source.is_absolute():
+                    raise ValueError('请输入本机的完整绝对路径。')
+                source = source.resolve()
+                if kind == 'local' and (not source.is_file() or source.suffix.lower() not in VIDEO_EXTENSIONS):
+                    raise ValueError('本地视频不存在或格式不受支持。')
+                if kind == 'screenshots' and (not source.is_dir() or not any(source.glob('*.png'))):
+                    raise ValueError('该文件夹不存在或没有 PNG 截图。')
+                filename = source.name
+            else:
+                raise ValueError('输入来源无效。')
+            job_id = self.server.add_job(filename, kind)
+            if kind == 'screenshots':
+                self.server.executor.submit(self.server.import_screenshots, job_id, source, options['mode'])
+            else:
+                self.server.executor.submit(self.server.convert, job_id, source, options)
+            self.send_json(202, self.server.snapshot(job_id))
+        else:
+            match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/(open|review)', path)
+            if not match:
+                return False
+            job_id, action = match.groups()
+            job = self.server.snapshot(job_id)
+            if not job:
+                self.send_json(404, {'error': '任务不存在。'})
+            elif action == 'open':
+                folder = Path(job['screenshots_path']) if job['screenshots_path'] else self.server.work_root / job_id
+                open_folder(folder)
+                self.send_json(200, {'path': str(folder)})
+            else:
+                choice = self.read_json().get('action')
+                if choice not in ('generate', 'keep'):
+                    raise ValueError('检查操作无效。')
+                with self.server.lock:
+                    current = self.server.jobs[job_id]
+                    if current['status'] != 'review':
+                        self.send_json(409, {'error': '该任务当前不在人工检查阶段。'})
+                        return True
+                    if choice == 'generate' and not any(Path(current['screenshots_path']).glob('*.png')):
+                        raise ValueError('截图目录为空，请保留至少一张 PNG。')
+                    current['status'] = 'queued' if choice == 'generate' else 'screenshots'
+                    current['pages'] = len(list(Path(current['screenshots_path']).glob('*.png')))
+                if choice == 'generate':
+                    self.server.executor.submit(self.server.compose, job_id)
+                self.send_json(202 if choice == 'generate' else 200, self.server.snapshot(job_id))
+        return True
 
 
 def create_server(port=8786, work_root=None):

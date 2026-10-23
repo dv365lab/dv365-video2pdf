@@ -9,6 +9,9 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 from urllib.parse import urlencode
 
 import cv2
@@ -50,13 +53,19 @@ class WebUITests(unittest.TestCase):
         })
         return status, json.loads(body)
 
+    def post_json(self, path, payload=None):
+        status, _, body = self.request('POST', path, json.dumps(payload or {}).encode(), {
+            'Content-Type': 'application/json', 'X-Upload-Token': self.server.upload_token,
+        })
+        return status, json.loads(body)
+
     def wait_for_job(self, job_id):
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             status, _, body = self.request("GET", "/api/jobs/" + job_id)
             self.assertEqual(status, 200)
             job = json.loads(body)
-            if job["status"] in ("done", "error"):
+            if job["status"] in ("done", "error", "review", "screenshots"):
                 return job
             time.sleep(0.05)
         self.fail("conversion did not finish")
@@ -78,6 +87,150 @@ class WebUITests(unittest.TestCase):
         self.assertIn(self.server.upload_token.encode(), body)
         for path in ("/app.js", "/style.css"):
             self.assertEqual(self.request("GET", path)[0], 200)
+
+    def test_open_output_uses_fixed_directory_and_requires_token(self):
+        with patch.object(web_ui, 'open_folder', create=True) as opened:
+            status, result = self.post_json('/api/output/open', {'path': 'C:/Windows'})
+            self.assertEqual(status, 200, result)
+            opened.assert_called_once_with(web_ui.PROJECT_ROOT / 'output')
+            status, _, _ = self.request('POST', '/api/output/open', b'{}')
+            self.assertEqual(status, 403)
+            self.assertEqual(opened.call_count, 1)
+
+    def test_folder_open_failure_is_reported(self):
+        with patch.object(web_ui, 'open_folder', side_effect=OSError('Explorer unavailable'), create=True):
+            status, result = self.post_json('/api/output/open')
+            self.assertEqual(status, 500)
+            self.assertIn('Explorer unavailable', result['error'])
+
+    def test_review_releases_queue_then_composes_remaining_screenshots(self):
+        status, job = self.upload('review.avi', self.make_video(), mode='review', sample_interval='0.5')
+        self.assertEqual(status, 202, job)
+        result = self.wait_for_job(job['id'])
+        self.assertEqual(result['status'], 'review', result)
+        self.assertIsNone(result['download_url'])
+        folder = Path(result['screenshots_path'])
+        # Review pauses this job without blocking another conversion.
+        status, second = self.upload('next.avi', self.make_video())
+        self.assertEqual(self.wait_for_job(second['id'])['status'], 'done')
+        with patch.object(web_ui, 'open_folder', create=True) as opened:
+            self.assertEqual(self.post_json('/api/jobs/' + job['id'] + '/open')[0], 200)
+            opened.assert_called_once_with(folder)
+        self.assertEqual(self.post_json('/api/jobs/' + job['id'] + '/review', {'action': 'generate'})[0], 202)
+        self.assertEqual(self.wait_for_job(job['id'])['status'], 'done')
+        self.assertEqual(self.post_json('/api/jobs/' + job['id'] + '/review', {'action': 'generate'})[0], 409)
+
+    def test_png_only_and_review_keep_do_not_generate_pdf(self):
+        for mode in ['png', 'review']:
+            status, job = self.upload(mode + '.avi', self.make_video(), mode=mode)
+            self.assertEqual(status, 202, job)
+            result = self.wait_for_job(job['id'])
+            if mode == 'review':
+                self.assertEqual(result['status'], 'review')
+                self.assertEqual(self.post_json('/api/jobs/' + job['id'] + '/review', {'action': 'keep'})[0], 200)
+                result = self.wait_for_job(job['id'])
+            self.assertEqual(result['status'], 'screenshots')
+            self.assertFalse(Path(result['screenshots_path'] + '.pdf').exists())
+
+    def test_existing_png_folder_rebuilds_in_isolated_output(self):
+        from PIL import Image
+        source = self.root / '已有截图 [1.1]'
+        source.mkdir()
+        Image.new('RGB', (64, 64), 'white').save(source / '000.png')
+        original = (source / '000.png').read_bytes()
+        status, job = self.post_json('/api/sources', {'kind': 'screenshots', 'source': str(source)})
+        self.assertEqual(status, 202, job)
+        result = self.wait_for_job(job['id'])
+        self.assertEqual(result['status'], 'done', result)
+        self.assertEqual((source / '000.png').read_bytes(), original)
+        self.assertFalse(Path(str(source) + '.pdf').exists())
+        self.assertEqual(self.request('GET', result['download_url'])[0], 200)
+
+    def test_local_path_converts_without_copying_video(self):
+        original = self.make_video()
+        status, job = self.post_json('/api/sources', {
+            'kind': 'local', 'source': str(self.root / 'source.avi'),
+            'options': {'crop_top': 4, 'mode': 'png', 'sample_interval': 2},
+        })
+        self.assertEqual(status, 202, job)
+        result = self.wait_for_job(job['id'])
+        self.assertEqual(result['status'], 'screenshots', result)
+        self.assertEqual((self.root / 'source.avi').read_bytes(), original)
+        self.assertFalse(list((self.root / 'jobs' / job['id']).glob('*.avi')))
+
+    def test_url_and_download_options_are_validated_and_queued(self):
+        options = {'referer': 'https://play.vidyard.com/', 'cookies_from_browser': 'edge:Default',
+                   'add_headers': ['Authorization: Bearer test'], 'mode': 'review', 'sample_interval': 0.5}
+        with patch.object(self.server.executor, 'submit') as submit:
+            status, job = self.post_json('/api/sources', {
+                'kind': 'url', 'source': 'https://example.com/lesson.mp4?a=1&b=2', 'options': options,
+            })
+            self.assertEqual(status, 202, job)
+            submitted = submit.call_args.args
+            self.assertIn('https://example.com/lesson.mp4?a=1&b=2', submitted)
+            self.assertEqual(submitted[-1]['add_headers'], options['add_headers'])
+            self.assertEqual(submitted[-1]['cookies_from_browser'], 'edge:Default')
+        for payload in [
+            {'kind': 'url', 'source': 'file:///C:/Windows'},
+            {'kind': 'url', 'source': 'https://'},
+            {'kind': 'local', 'source': str(self.root / 'missing.mp4')},
+            {'kind': 'screenshots', 'source': str(self.root)},
+            {'kind': 'url', 'source': 'https://example.com', 'options': {'referer': 'invalid'}},
+            {'kind': 'url', 'source': 'https://example.com', 'options': {'add_headers': ['broken']}},
+        ]:
+            with self.subTest(payload=payload):
+                self.assertEqual(self.post_json('/api/sources', payload)[0], 400)
+
+    def test_download_settings_and_sampling_reach_cli_as_separate_arguments(self):
+        options = web_ui.parse_options({'referer': 'https://example.com/page?a=1&b=2',
+            'cookies_from_browser': 'edge:Default', 'add_headers': ['User-Agent: Example Test'],
+            'sample_interval': 0.5, 'remove_qr': True})
+        job_id = self.server.add_job('url test', 'url')
+        with patch.object(self.server, 'run_command') as run, patch.object(self.server, 'finish_pdf'):
+            self.server.convert(job_id, 'https://example.com/lesson?a=1&b=2', options)
+        command = run.call_args.args[1]
+        for flag, expected in [('--referer', options['referer']), ('--cookies-from-browser', 'edge:Default'),
+                               ('--add-header', 'User-Agent: Example Test'), ('--sample-interval', '0.5')]:
+            self.assertEqual(command[command.index(flag) + 1], expected)
+        self.assertIn('--remove-qr', command)
+
+    @unittest.skipUnless((web_ui.PROJECT_ROOT / '.tools/yt-dlp.exe').is_file() or shutil.which('yt-dlp'), 'yt-dlp unavailable')
+    def test_http_video_url_converts_through_web_queue(self):
+        self.make_video()
+        class QuietHandler(SimpleHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+        source_server = ThreadingHTTPServer(('127.0.0.1', 0), partial(QuietHandler, directory=str(self.root)))
+        thread = threading.Thread(target=source_server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            status, job = self.post_json('/api/sources', {
+                'kind': 'url', 'source': f'http://127.0.0.1:{source_server.server_port}/source.avi?a=1&b=2',
+            })
+            self.assertEqual(status, 202, job)
+            result = self.wait_for_job(job['id'])
+            self.assertEqual(result['status'], 'done', result)
+            self.assertEqual(self.request('GET', result['download_url'])[0], 200)
+        finally:
+            source_server.shutdown()
+            source_server.server_close()
+            thread.join(timeout=3)
+
+    def test_empty_review_folder_keeps_review_state_and_reports_error(self):
+        status, job = self.upload('empty-review.avi', self.make_video(), mode='review')
+        result = self.wait_for_job(job['id'])
+        for image in Path(result['screenshots_path']).glob('*.png'):
+            image.unlink()
+        status, response = self.post_json('/api/jobs/' + job['id'] + '/review', {'action': 'generate'})
+        self.assertEqual(status, 400, response)
+        self.assertEqual(self.server.snapshot(job['id'])['status'], 'review')
+
+    def test_downloader_setup_uses_existing_setup_script(self):
+        with patch.object(self.server.executor, 'submit') as submit:
+            status, job = self.post_json('/api/downloader')
+            self.assertEqual(status, 202, job)
+            self.assertEqual(job['kind'], 'downloader')
+            submit.assert_called_once()
 
     def test_uploaded_video_converts_and_downloads_cropped_pdf(self):
         status, job = self.upload("课程 1.1 [6u5TQ3UscDo].avi", self.make_video(), crop_top=4, crop_bottom=6, remove_qr="true")
@@ -122,6 +275,10 @@ class WebUITests(unittest.TestCase):
             ("lesson.mp4", b"data", {"crop_top": -1}),
             ("lesson.mp4", b"data", {"crop_bottom": "1.5"}),
             ("lesson.mp4", b"data", {"remove_qr": "maybe"}),
+            ("lesson.mp4", b"data", {"mode": "invalid"}),
+            ("lesson.mp4", b"data", {"sample_interval": "0"}),
+            ("lesson.mp4", b"data", {"sample_interval": "nan"}),
+            ("lesson.mp4", b"data", {"sample_interval": "inf"}),
             ("../escape.mp4", b"data", {}),
             ("C:\\escape.mp4", b"data", {}),
         ):

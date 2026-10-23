@@ -10,9 +10,16 @@
 </head>
 <body>
   <main>
-    <header><a class="brand" href="/">video<span>2</span>pdf</a><span class="local"><i></i> 本地运行</span></header>
+    <header><a class="brand" href="/">video<span>2</span>pdf</a><div class="header-actions"><span class="local"><i></i> 本地运行</span><button id="open-output" type="button" class="secondary folder-button" title="在文件资源管理器中打开项目 output 目录"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7Z"/><path d="M3 9h18"/></svg>打开 output</button></div></header>
     <section class="intro"><p class="eyebrow">让视频里的知识，留在纸上</p><h1>视频拖进来，<br>幻灯片带走。</h1><p>自动提取视频中的稳定画面，整理为 PDF。<br>适合课程、幻灯片与屏幕演示。</p></section>
     <section class="workspace" aria-label="视频转换">
+      <div class="source-tabs" role="tablist" aria-label="输入来源">
+        <button id="tab-files" type="button" role="tab" aria-selected="true" aria-controls="panel-files">上传视频</button>
+        <button id="tab-url" type="button" role="tab" aria-selected="false" aria-controls="panel-url">视频网址</button>
+        <button id="tab-local" type="button" role="tab" aria-selected="false" aria-controls="panel-local">本地路径</button>
+        <button id="tab-screenshots" type="button" role="tab" aria-selected="false" aria-controls="panel-screenshots">已有 PNG 合成</button>
+      </div>
+      <div id="panel-files" role="tabpanel" aria-labelledby="tab-files">
       <div class="drop-zone" id="drop-zone">
         <div class="upload-icon" aria-hidden="true">↑</div>
         <h2>将视频拖到这里</h2>
@@ -21,19 +28,53 @@
         <input type="file" id="file-input" accept="video/*,.mkv,.avi,.ts,.mts,.m2ts,.flv" multiple hidden>
         <small>文件仅传入本机服务，处理过程无需联网</small>
       </div>
+      </div>
+      <div id="panel-url" class="source-panel" role="tabpanel" aria-labelledby="tab-url" hidden>
+        <label for="video-urls">视频网址 <small>每行一个，可一次添加多个</small></label>
+        <textarea id="video-urls" rows="3" placeholder="https://www.youtube.com/watch?v=…&#10;https://example.com/lesson.mp4"></textarea>
+        <p class="hint">支持视频网站、视频直链和 HLS 链接；先下载到本机再转换。Vidyard 自动补充来源地址并选择主播放列表。</p>
+        <button id="add-url" type="button" class="secondary">添加网址</button>
+        <details class="download-options"><summary>下载设置与下载器</summary>
+          <div class="download-fields">
+            <label for="referer">来源页面 Referer <input id="referer" type="url" placeholder="留空时自动处理 Vidyard"></label>
+            <label for="cookies-from-browser">浏览器 Cookie 来源 <input id="cookies-from-browser" list="browsers" placeholder="留空不读取；如 edge 或 chrome:Default"></label>
+            <datalist id="browsers"><option value="edge"><option value="chrome"><option value="firefox"></datalist>
+            <label for="add-headers" class="wide">附加请求头 <textarea id="add-headers" rows="2" placeholder="每行一个，例如 User-Agent: …"></textarea></label>
+          </div>
+          <p class="hint">仅用于本次网址任务。选择浏览器后，下载器会读取该浏览器的登录 Cookie。</p>
+          <button id="setup-downloader" type="button" class="secondary">安装 / 更新下载器</button>
+          <p class="hint">缺少下载器或下载失败时可运行；需要联网，进度显示在下方任务日志中。</p>
+        </details>
+      </div>
+      <div id="panel-local" class="source-panel" role="tabpanel" aria-labelledby="tab-local" hidden>
+        <label for="video-paths">本地视频完整路径 <small>每行一个，适合大文件，无需上传副本</small></label>
+        <textarea id="video-paths" rows="3" placeholder="F:\Download\课程\1.1.mp4"></textarea>
+        <button id="add-local" type="button" class="secondary">添加本地路径</button>
+      </div>
+      <div id="panel-screenshots" class="source-panel" role="tabpanel" aria-labelledby="tab-screenshots" hidden>
+        <label for="screenshots-path">PNG 截图文件夹的完整路径</label>
+        <input id="screenshots-path" type="text" placeholder="F:\Projects\video2pdf\output\1.1_noqr">
+        <p class="hint">按文件名排序合成 PDF，并自动清理指定品牌文字。使用截图副本，原目录不变；不重复执行裁剪和二维码移除。</p>
+        <button id="add-screenshots" type="button" class="secondary">添加截图文件夹</button>
+      </div>
       <form id="convert-form">
-        <div class="options-heading"><h2>处理选项</h2><span>默认保留完整画面</span></div>
+        <div class="options-heading"><h2>视频画面处理</h2><span>应用于本次提交的视频任务</span></div>
         <div class="options">
           <label>顶部裁剪 <span>像素</span><input id="crop-top" type="number" min="0" step="1" value="0" required></label>
           <label>底部裁剪 <span>像素</span><input id="crop-bottom" type="number" min="0" step="1" value="0" required></label>
-          <label class="checkbox"><input id="remove-qr" type="checkbox"><span>自动移除二维码<small>用附近背景色覆盖</small></span></label>
+          <label>采样间隔 <span>秒</span><input id="sample-interval" type="number" min="0.01" step="any" value="1" required></label>
         </div>
-        <div class="action-row"><span id="selection-count">还未添加视频</span><button type="submit" class="primary" id="convert" disabled>开始转换 <span aria-hidden="true">→</span></button></div>
+        <p class="hint">间隔越小越容易保留短停留页面，也会增加处理时间；最终仍按内容变化选择截图。</p>
+        <label class="checkbox"><input id="remove-qr" type="checkbox"><span>自动移除二维码<small>用附近背景色覆盖，可与上下裁剪一起使用</small></span></label>
+        <div class="branding-note"><div><strong>品牌标记自动清理</strong><span class="enabled">默认开启</span></div><p>半导体教育领航者 · 移知 · www.eeeknow.com · www.eeeknow.com（移知）及格式变体</p><p>右下角移知图形 Logo、字样、小网址和日期时间整块清理</p><small>识别到该 Logo 后，用附近背景色覆盖至右下边缘；其他 Logo 不处理。仅清理 PDF，原 PNG 保留；复杂背景可能留下覆盖痕迹。</small></div>
+        <label class="output-mode" for="output-mode">输出方式</label><select id="output-mode"><option value="auto">自动生成 PDF，同时保留 PNG</option><option value="review">先检查 PNG，再确认生成 PDF</option><option value="png">仅保存 PNG，暂不生成 PDF</option></select>
+        <p class="hint">选择人工检查后，可打开截图目录删除多余页面，再点击任务上的“确认生成 PDF”。</p>
+        <div class="action-row"><span id="selection-count">还未添加待处理任务</span><button type="submit" class="primary" id="convert" disabled>开始转换 <span aria-hidden="true">→</span></button></div>
       </form>
     </section>
     <p id="notice" class="notice" role="status" aria-live="polite"></p>
-    <section class="queue" aria-label="任务列表"><div class="queue-heading"><h2>视频列表</h2><span id="queue-count">0 个视频</span></div><p id="empty">添加视频后，可在这里查看转换状态并下载 PDF。</p><div id="jobs"></div></section>
-    <footer>逐个处理 · 自动生成 PDF · 同名文件独立保存</footer>
+    <section class="queue" aria-label="任务列表"><div class="queue-heading"><h2>任务列表</h2><span id="queue-count">0 个任务</span></div><p id="empty">添加视频或截图后，可在这里查看状态、检查截图、打开结果目录并下载 PDF。</p><div id="jobs"></div></section>
+    <footer>逐个处理 · 本地 OCR · PNG / PDF 独立保存</footer>
   </main>
 </body>
 </html>
