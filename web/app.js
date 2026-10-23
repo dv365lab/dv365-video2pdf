@@ -4,6 +4,7 @@ const $ = (id) => document.getElementById(id);
 const extensions = new Set(["mp4", "avi", "mov", "mkv", "webm", "m4v", "wmv", "mpg", "mpeg", "ts", "mts", "m2ts", "flv"]);
 const entries = [];
 let uploading = false;
+let rejectedFiles = [];
 
 function updateCount() {
   const pending = entries.filter((entry) => entry.state === "pending").length;
@@ -11,6 +12,22 @@ function updateCount() {
   $("queue-count").textContent = `${entries.length} 个任务`;
   $("empty").hidden = entries.length > 0;
   $("convert").disabled = !pending || uploading;
+  updateDropFeedback();
+}
+
+function updateDropFeedback() {
+  const files = entries.filter((entry) => entry.kind === "file");
+  const pending = files.filter((entry) => entry.state === "pending").length;
+  $("drop-title").textContent = files.length ? `已添加 ${files.length} 个视频` : rejectedFiles.length ? "文件未添加成功" : "将视频拖到这里";
+  $("drop-icon").textContent = files.length ? "✓" : rejectedFiles.length ? "!" : "↑";
+  $("drop-description").textContent = files.length ? "可以继续拖入视频，或点击按钮追加文件" : "支持多个视频 · MP4 / AVI / MOV / MKV 等";
+  $("drop-feedback").hidden = !files.length && !rejectedFiles.length;
+  $("drop-feedback-files").textContent = files.slice(0, 3).map((entry) => entry.name).join("、") + (files.length > 3 ? ` 等 ${files.length} 个文件` : "");
+  $("drop-feedback-help").textContent = rejectedFiles.length
+    ? `未添加：${rejectedFiles.join("、")}。请使用非空视频文件。${pending ? "已添加的视频可点击下方“开始转换”。" : ""}`
+    : pending ? `${pending} 个视频等待开始，请点击下方“开始转换”。` : "视频已提交，请在下方任务列表查看处理进度。";
+  $("drop-zone").classList[files.length ? "add" : "remove"]("has-files");
+  $("drop-zone").classList[rejectedFiles.length ? "add" : "remove"]("has-rejected");
 }
 
 function makeElement(tag, className, text) {
@@ -31,9 +48,15 @@ function addEntry(values) {
   entry.progress = document.createElement("progress");
   entry.progress.max = 100;
   entry.progress.value = 0;
-  entry.progress.hidden = true;
-  entry.progress.setAttribute("aria-label", `${entry.name} 上传进度`);
-  info.append(entry.progress);
+  entry.progress.setAttribute("aria-label", `${entry.name} 处理进度`);
+  entry.progressPanel = makeElement("div", "job-progress");
+  entry.progressPanel.hidden = true;
+  const progressHead = makeElement("div", "progress-head");
+  entry.progressStage = makeElement("span", "progress-stage");
+  entry.progressValue = makeElement("strong", "progress-value");
+  entry.progressDetail = makeElement("p", "progress-detail");
+  progressHead.append(entry.progressStage, entry.progressValue);
+  entry.progressPanel.append(progressHead, entry.progress, entry.progressDetail);
   entry.actions = makeElement("div", "job-actions");
   const remove = makeElement("button", "remove", "移除");
   remove.type = "button";
@@ -48,7 +71,7 @@ function addEntry(values) {
   entry.details.hidden = true;
   entry.log = document.createElement("pre");
   entry.details.append(makeElement("summary", "", "查看处理日志"), entry.log);
-  entry.card.append(row, entry.details);
+  entry.card.append(row, entry.progressPanel, entry.details);
   $("jobs").append(entry.card);
   entries.push(entry);
   updateCount();
@@ -65,7 +88,44 @@ function addFiles(files) {
     addEntry({ file, kind: "file", name: file.name });
   }
   $("notice").textContent = invalid.length ? `未添加空文件或不支持的格式：${invalid.join("、")}` : "";
+  rejectedFiles = invalid;
   updateCount();
+}
+
+function setProgress(entry, stage, value, percent, detail = "") {
+  entry.progressPanel.hidden = false;
+  entry.progress.hidden = false;
+  entry.progressStage.textContent = stage;
+  entry.progressValue.textContent = value;
+  entry.progressDetail.textContent = detail;
+  entry.progressDetail.hidden = !detail;
+  entry.progress.setAttribute("aria-label", `${entry.name} · ${stage}`);
+  entry.progress.setAttribute("aria-valuetext", `${value} ${detail}`);
+  if (Number.isFinite(percent)) entry.progress.value = percent;
+  else entry.progress.removeAttribute("value");
+}
+
+function showJobProgress(entry, job) {
+  const progress = job.progress || {};
+  if (job.status === "error") { entry.progressPanel.hidden = true; return; }
+  if (job.status === "queued") {
+    setProgress(entry, "等待处理", "排队中", null);
+    entry.progress.hidden = true;
+  } else if (job.status === "done" || job.status === "screenshots") {
+    setProgress(entry, "处理完成", "100%", 100, job.kind === "downloader" ? "下载器已就绪" : `共 ${job.pages} ${job.status === "screenshots" ? "张 PNG" : "页 PDF"}`);
+  } else if (job.status === "review") {
+    setProgress(entry, "截图已就绪", `共 ${job.pages} 页`, null, "等待检查截图并确认生成 PDF");
+    entry.progress.hidden = true;
+  } else if (progress.stage === "clean") {
+    setProgress(entry, "清理 PDF 页面", `第 ${progress.current} / ${progress.total} 页`, progress.percent,
+      `已完成 ${progress.completed} 页 · ${progress.percent}%`);
+  } else if (progress.stage === "write") {
+    setProgress(entry, "合成 PDF", `共 ${progress.total} 页`, null, "页面处理完毕，正在写入 PDF 文件…");
+  } else {
+    const label = {extract: "提取视频画面", download: "下载视频", copy: "准备截图"}[progress.stage] || "准备处理";
+    const detail = progress.stage === "download" ? "当前下载文件的进度" : progress.stage === "copy" ? `${progress.current} / ${progress.total} 页` : "";
+    setProgress(entry, label, Number.isFinite(progress.percent) ? `${progress.percent}%` : "处理中", progress.percent, detail);
+  }
 }
 
 function upload(entry, options) {
@@ -78,7 +138,7 @@ function upload(entry, options) {
     request.upload.addEventListener("progress", (event) => {
       if (event.lengthComputable) {
         const percent = Math.round(event.loaded / event.total * 100);
-        entry.progress.value = percent;
+        setProgress(entry, "上传到本机", `${percent}%`, percent);
         entry.status.textContent = percent === 100 ? "上传完成，正在加入队列…" : `正在上传 ${percent}%`;
       }
     });
@@ -128,6 +188,7 @@ function showError(entry, error) {
   entry.card.className = "job error";
   entry.status.textContent = error.message;
   entry.progress.hidden = true;
+  entry.progressPanel.hidden = true;
 }
 
 async function poll(entry) {
@@ -139,7 +200,8 @@ async function poll(entry) {
     entry.log.textContent = job.log;
     entry.details.hidden = !job.log;
     entry.card.className = `job ${job.status}`;
-    entry.status.textContent = { queued: "已加入队列，等待处理…", running: "正在处理，请查看下方日志…", done: job.kind === "downloader" ? "下载器安装 / 更新完成" : `转换完成 · ${job.pages} 页`, review: `待人工检查 · ${job.pages} 张 PNG。打开目录删除多余页面后，确认生成 PDF。`, screenshots: `已保留 ${job.pages} 张 PNG，未生成 PDF`, error: "处理失败，请展开日志查看原因。" }[job.status];
+    entry.status.textContent = { queued: "已加入队列，等待处理…", running: "正在处理，下方显示当前阶段进度。", done: job.kind === "downloader" ? "下载器安装 / 更新完成" : `转换完成 · ${job.pages} 页`, review: `待人工检查 · ${job.pages} 张 PNG。打开目录删除多余页面后，确认生成 PDF。`, screenshots: `已保留 ${job.pages} 张 PNG，未生成 PDF`, error: "处理失败，请展开日志查看原因。" }[job.status];
+    showJobProgress(entry, job);
     entry.actions.replaceChildren();
     if (job.status === "done") {
       if (job.download_url) {
@@ -247,13 +309,12 @@ $("convert-form").addEventListener("submit", async (event) => {
   updateCount();
   for (const entry of pending) {
     entry.status.textContent = entry.kind === "file" ? "正在上传…" : "正在提交…";
-    entry.progress.hidden = entry.kind !== "file";
+    setProgress(entry, entry.kind === "file" ? "上传到本机" : "提交任务", entry.kind === "file" ? "0%" : "请稍候", entry.kind === "file" ? 0 : null);
     try {
       const job = entry.kind === "file" ? await upload(entry, options) : await post("/api/sources", {
         kind: entry.kind, source: entry.source, options: { ...options, ...(entry.kind === "url" ? downloadOptions : {}) },
       });
       entry.id = job.id;
-      entry.progress.hidden = true;
       poll(entry);
     } catch (error) { showError(entry, error); }
     entry.file = null;

@@ -14,6 +14,7 @@ class Element {
   append(...children) { this.children.push(...children); }
   addEventListener(name, handler) { this.handlers[name] = handler; }
   setAttribute(name, value) { this[name] = value; }
+  removeAttribute(name) { delete this[name]; }
   replaceChildren(...children) { this.children = children; }
   remove() { this.removed = true; }
 }
@@ -31,6 +32,8 @@ async function run() {
   const requests = [];
   const apiRequests = [];
   const jobs = new Map();
+  const scheduledPolls = [];
+  let nextJobState = null;
   let sourceId = 0;
   class Upload {
     constructor() { this.upload = new Element(); }
@@ -49,7 +52,7 @@ async function run() {
     XMLHttpRequest: Upload,
     URLSearchParams,
     URL,
-    setTimeout: () => { throw new Error("completed jobs must stop polling"); },
+    setTimeout: (callback) => scheduledPolls.push(callback),
     fetch: async (url, options) => {
       if (options) {
         const body = JSON.parse(options.body);
@@ -64,7 +67,7 @@ async function run() {
         }
         const id = "source" + (++sourceId);
         const kind = url === "/api/downloader" ? "downloader" : body.kind;
-        const job = { id, kind, filename: "下载器", pages: 2, log: "complete", screenshots_path: "output/test", status: body.options?.mode === "review" ? "review" : "done", download_url: kind === "downloader" ? null : "result.pdf" };
+        const job = { id, kind, filename: "下载器", pages: 2, log: "complete", screenshots_path: "output/test", status: body.options?.mode === "review" ? "review" : "done", download_url: kind === "downloader" ? null : "result.pdf", ...nextJobState };
         jobs.set("/api/jobs/" + id, job);
         return { ok: true, json: async () => ({ id, kind, filename: job.filename }) };
       }
@@ -72,6 +75,9 @@ async function run() {
     },
   });
   const drop = getElement("drop-zone").handlers.drop;
+  drop({ preventDefault() {}, dataTransfer: {files: [{name: "invalid.txt", size: 10}]} });
+  assert.equal(getElement("drop-title").textContent, "文件未添加成功");
+  assert.match(getElement("drop-feedback-help").textContent, /invalid.txt/);
   let prevented = false;
   drop({ preventDefault: () => { prevented = true; }, dataTransfer: { files: [
     { name: "lesson.1.mp4", size: 100 }, { name: "lesson.2.avi", size: 200 },
@@ -81,10 +87,16 @@ async function run() {
   assert.equal(getElement("queue-count").textContent, "2 个任务");
   assert.equal(getElement("convert").disabled, false);
   assert.match(getElement("notice").textContent, /notes.txt.*empty.mp4/);
+  assert.equal(getElement("drop-title").textContent, "已添加 2 个视频");
+  assert.equal(getElement("drop-feedback").hidden, false);
+  assert.match(getElement("drop-feedback-files").textContent, /lesson.1.mp4.*lesson.2.avi/);
+  assert.match(getElement("drop-feedback-help").textContent, /notes.txt.*empty.mp4/);
   const firstCard = getElement("jobs").children[0];
   firstCard.children[0].children[2].children[0].handlers.click();
   assert.equal(firstCard.removed, true);
   assert.equal(getElement("queue-count").textContent, "1 个任务");
+  assert.equal(getElement("drop-title").textContent, "已添加 1 个视频");
+  assert.doesNotMatch(getElement("drop-feedback-files").textContent, /lesson.1.mp4/);
   // A file name resembling markup must remain plain text.
   getElement("file-input").handlers.change({ target: { files: [{ name: "<img>.mp4", size: 100 }] } });
   const lastCard = getElement("jobs").children[2];
@@ -106,6 +118,10 @@ async function run() {
   assert.equal(lastCard.className, "job done");
   assert.equal(lastCard.children[0].children[2].children[0].textContent, "下载 PDF ↓");
   assert.equal(getElement("convert").disabled, true);
+  assert.equal(lastCard.children[1].hidden, false);
+  assert.equal(lastCard.children[1].children[0].children[1].textContent, "100%");
+  assert.match(getElement("drop-feedback-help").textContent, /已提交/);
+  assert.equal(scheduledPolls.length, 0, 'completed jobs must stop polling');
 
   await getElement("open-output").handlers.click();
   assert.equal(apiRequests.at(-1).url, "/api/output/open");
@@ -153,7 +169,35 @@ async function run() {
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(apiRequests.at(-1).url, "/api/downloader");
   assert.equal(getElement("jobs").children.at(-1).className, "job done");
-  console.log("Uploads, URLs, paths, PNG rebuild, review actions, downloader and output-folder buttons: passed");
+
+  nextJobState = { status: 'running', progress: {stage: 'extract', percent: 42} };
+  getElement('video-urls').value = 'https://example.com/progress.mp4';
+  getElement('add-url').handlers.click();
+  getElement('output-mode').value = 'auto';
+  await getElement('convert-form').handlers.submit({preventDefault() {}});
+  await new Promise((resolve) => setImmediate(resolve));
+  const progressCard = getElement('jobs').children.at(-1);
+  const panel = progressCard.children[1];
+  const progressJob = jobs.get('/api/jobs/source' + sourceId);
+  assert.equal(panel.hidden, false);
+  assert.equal(panel.children[0].children[1].textContent, '42%');
+  assert.equal(panel.children[1].value, 42);
+  progressJob.progress = {stage:'clean', current:3, total:8, completed:2, percent:25};
+  await scheduledPolls.shift()();
+  assert.equal(panel.children[0].children[1].textContent, '第 3 / 8 页');
+  assert.match(panel.children[2].textContent, /已完成 2 页.*25%/);
+  progressJob.progress = {stage:'write', current:8, total:8, percent:null};
+  await scheduledPolls.shift()();
+  assert.equal(panel.children[0].children[1].textContent, '共 8 页');
+  assert.equal(panel.children[1].value, undefined, 'writing must not show an invented percentage');
+  progressJob.progress = {stage:'extract', total:null, percent:null};
+  await scheduledPolls.shift()();
+  assert.equal(panel.children[0].children[1].textContent, '处理中');
+  progressJob.status = 'error';
+  await scheduledPolls.shift()();
+  assert.equal(panel.hidden, true, 'an error must not retain a success progress display');
+  assert.equal(scheduledPolls.length, 0);
+  console.log("Uploads, drop feedback, stage percentages, page counts, review and folder actions: passed");
 }
 
 run().catch((error) => { console.error(error); process.exitCode = 1; });

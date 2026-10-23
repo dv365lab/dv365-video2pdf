@@ -21,11 +21,12 @@
       </div>
       <div id="panel-files" role="tabpanel" aria-labelledby="tab-files">
       <div class="drop-zone" id="drop-zone">
-        <div class="upload-icon" aria-hidden="true">↑</div>
-        <h2>将视频拖到这里</h2>
-        <p>支持多个视频 · MP4 / AVI / MOV / MKV 等</p>
+        <div class="upload-icon" id="drop-icon" aria-hidden="true">↑</div>
+        <h2 id="drop-title">将视频拖到这里</h2>
+        <p id="drop-description">支持多个视频 · MP4 / AVI / MOV / MKV 等</p>
         <button type="button" class="secondary" id="choose">选择视频文件</button>
         <input type="file" id="file-input" accept="video/*,.mkv,.avi,.ts,.mts,.m2ts,.flv" multiple hidden>
+        <div id="drop-feedback" class="drop-feedback" role="status" aria-live="polite" hidden><p id="drop-feedback-files"></p><p id="drop-feedback-help"></p></div>
         <small>文件仅传入本机服务，处理过程无需联网</small>
       </div>
       </div>

@@ -38,6 +38,31 @@ def http_url(value):
     return parts.scheme in ('http', 'https') and bool(parts.hostname)
 
 
+def parse_progress(line):
+    '''Read CLI stage events and yt-dlp's current-file download percentage.'''
+    if line.startswith('VIDEO2PDF_PROGRESS '):
+        try:
+            event = json.loads(line[len('VIDEO2PDF_PROGRESS '):])
+            stage = event['stage']
+            if stage not in ('extract', 'clean', 'write'):
+                return None
+            current, total = event.get('current', 0), event.get('total')
+            completed = event.get('completed', current)
+            if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                   for value in (current, completed)):
+                return None
+            if total is not None and (type(total) not in (int, float) or not math.isfinite(total) or total < 0):
+                return None
+            percent = min(100, int(completed * 100 / total)) if total and stage != 'write' else None
+            return dict(stage=stage, current=current, total=total, completed=completed, percent=percent)
+        except (ValueError, TypeError, KeyError):
+            return None
+    match = re.match(r'\[download\]\s+(\d+(?:\.\d+)?)%', line)
+    if match:
+        return dict(stage='download', percent=min(100, int(float(match.group(1)))))
+    return None
+
+
 def parse_options(values):
     if not isinstance(values, dict):
         raise ValueError('处理选项无效。')
@@ -96,20 +121,24 @@ class WebServer(ThreadingHTTPServer):
         job_id = job_id or uuid.uuid4().hex
         (self.work_root / job_id).mkdir(exist_ok=True)
         job = dict(id=job_id, filename=filename, kind=kind, status='queued', log='',
-                   pages=None, download_url=None, screenshots_path=None)
+                   pages=None, download_url=None, screenshots_path=None, progress=None)
         with self.lock:
             self.jobs[job_id] = job
         return job_id
 
     def run_command(self, job_id, command, cwd):
-        self.update(job_id, status='running')
+        self.update(job_id, status='running', progress=None)
         log = self.snapshot(job_id)['log']
         with subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               encoding='utf-8', errors='replace') as process:
             for line in process.stdout:
-                log = (log + line)[-16000:]
-                self.update(job_id, log=log)
+                progress = parse_progress(line)
+                if progress is not None:
+                    self.update(job_id, progress=progress)
+                if not line.startswith('VIDEO2PDF_PROGRESS '):
+                    log = (log + line)[-16000:]
+                    self.update(job_id, log=log)
             if process.wait() != 0:
                 raise RuntimeError('处理失败，请查看上方日志。')
 
@@ -122,7 +151,8 @@ class WebServer(ThreadingHTTPServer):
             raise ValueError('未生成 PDF，请检查视频或截图。')
         folder = pdfs[0].with_suffix('')
         self.update(job_id, status='done', pages=len(list(folder.glob('*.png'))),
-                    screenshots_path=str(folder), download_url=f'/api/jobs/{job_id}/pdf')
+                    screenshots_path=str(folder), download_url=f'/api/jobs/{job_id}/pdf',
+                    progress=dict(stage='done', percent=100))
 
     def convert(self, job_id, source, options):
         command = [
@@ -170,8 +200,10 @@ class WebServer(ThreadingHTTPServer):
             folder = self.work_root / job_id / 'output' / (source.name or 'screenshots')
             folder.mkdir(parents=True)
             files = sorted(source.glob('*.png'))
-            for path in files:
+            for index, path in enumerate(files):
                 shutil.copy2(path, folder / path.name)
+                self.update(job_id, progress=dict(stage='copy', current=index + 1, total=len(files),
+                                                 percent=int((index + 1) * 100 / len(files))))
             self.update(job_id, screenshots_path=str(folder), pages=len(files))
             if mode in ('review', 'png'):
                 self.update(job_id, status='review' if mode == 'review' else 'screenshots')

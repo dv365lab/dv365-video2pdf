@@ -31,6 +31,11 @@ PAGE_CHANGE_PERCENT = 0.1        # Persistent content change relative to the sel
 SCENE_CHANGE_PERCENT = 3         # Preserve the preceding frame before a large transition.
 
 
+def report_progress(stage, **values):
+    '''Send flushed stage progress to the GUI without estimating remaining work.'''
+    print('VIDEO2PDF_PROGRESS ' + json.dumps(dict(stage=stage, **values)), flush=True)
+
+
 def resolve_video_source(source, referer=None, cookies_from_browser=None, add_headers=None):
     '''Download HTTP(S) video links; leave local paths unchanged.'''
     if source.lower().startswith(('http://', 'https://')):
@@ -169,6 +174,9 @@ def get_frames(video_path):
     frame_count = 0
     print("total_frames: ", total_frames)
     print("FRAME_RATE", FRAME_RATE)
+    total_samples = math.ceil(duration * FRAME_RATE) if duration and math.isfinite(duration) else None
+    report_progress('extract', current=0, total=total_samples)
+    last_percent = 0
 
     # loop over the frames of the video
     # Some decoders keep returning the last frame after an out-of-range seek.
@@ -184,6 +192,11 @@ def get_frames(video_path):
 
         frame_count += 1
         yield frame_count, frame_time, frame
+        # The caller has finished processing this frame when the generator resumes.
+        percent = min(100, int(frame_count * 100 / total_samples)) if total_samples else None
+        if percent is None or percent != last_percent:
+            report_progress('extract', current=frame_count, total=total_samples)
+            last_percent = percent
         frame_time = frame_count / FRAME_RATE
 
     vs.release()
@@ -451,6 +464,7 @@ def convert_screenshots_to_pdf(output_folder_screenshot_path):
     with tempfile.TemporaryDirectory(prefix='video2pdf-text-') as temp:
         pdf_images = []
         for index, path in enumerate(screenshots):
+            report_progress('clean', current=index + 1, total=len(screenshots), completed=index)
             print(f'清理 PDF 品牌标记 {index + 1}/{len(screenshots)}: {path.name}', flush=True)
             with Image.open(path) as source:
                 frame = np.ascontiguousarray(np.asarray(source.convert('RGB'))[:, :, ::-1])
@@ -463,6 +477,7 @@ def convert_screenshots_to_pdf(output_folder_screenshot_path):
                 else:
                     pdf_images.append(str(path))
         # Do not truncate an existing PDF if OCR or image conversion fails.
+        report_progress('write', current=len(screenshots), total=len(screenshots))
         pdf_bytes = img2pdf.convert(pdf_images)
         with open(output_pdf_path, "wb") as f:
             f.write(pdf_bytes)
