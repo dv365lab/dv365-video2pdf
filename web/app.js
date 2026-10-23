@@ -5,6 +5,48 @@ const extensions = new Set(["mp4", "avi", "mov", "mkv", "webm", "m4v", "wmv", "m
 const entries = [];
 let uploading = false;
 let rejectedFiles = [];
+let uploadToken = document.querySelector('meta[name="upload-token"]').content;
+let retryingAll = false;
+let activeRequests = 0;
+const requestWaiters = [];
+// A recovery link can reconnect a pre-upgrade batch without stopping its server.
+const recoveryIds = [...new Set((new URLSearchParams((window.location?.hash || "").replace(/^#/, "")).get("jobs") || "")
+  .split(",").filter((id) => /^[a-f0-9]{32}$/.test(id)))].slice(0, 1000);
+class ConnectionError extends Error {}
+class ApiError extends Error {
+  constructor(message, status) { super(message); this.status = status; }
+}
+
+// Bound simultaneous status requests when a large batch is being processed.
+async function requestJson(path, options = {}) {
+  if (activeRequests >= 4) await new Promise((resolve) => requestWaiters.push(resolve));
+  else activeRequests += 1;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(path, { ...options, signal: controller.signal });
+    const result = await response.json();
+    if (!response.ok) throw new ApiError(result.error || "请求失败，请稍后重试。", response.status);
+    return result;
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ConnectionError("暂时无法连接本机服务，请保持启动窗口运行。正在自动重连…");
+  } finally {
+    clearTimeout(timer);
+    if (requestWaiters.length) requestWaiters.shift()();
+    else activeRequests -= 1;
+  }
+}
+
+async function refreshSession() {
+  const session = await requestJson("/api/session");
+  uploadToken = session.upload_token;
+}
+
+function canRetry(entry) {
+  return ["error", "interrupted", "connection"].includes(entry.state)
+    && entry.retryAvailable !== false && Boolean(entry.id || entry.file || entry.source);
+}
 
 function updateCount() {
   const pending = entries.filter((entry) => entry.state === "pending").length;
@@ -12,6 +54,9 @@ function updateCount() {
   $("queue-count").textContent = `${entries.length} 个任务`;
   $("empty").hidden = entries.length > 0;
   $("convert").disabled = !pending || uploading;
+  const failed = entries.filter(canRetry).length;
+  $("retry-failed").disabled = !failed || retryingAll;
+  $("retry-failed").textContent = retryingAll ? "正在重试…" : `一键重试失败任务${failed ? `（${failed}）` : ""}`;
   updateDropFeedback();
 }
 
@@ -107,7 +152,7 @@ function setProgress(entry, stage, value, percent, detail = "") {
 
 function showJobProgress(entry, job) {
   const progress = job.progress || {};
-  if (job.status === "error") { entry.progressPanel.hidden = true; return; }
+  if (["error", "interrupted"].includes(job.status)) { entry.progressPanel.hidden = true; return; }
   if (job.status === "queued") {
     setProgress(entry, "等待处理", "排队中", null);
     entry.progress.hidden = true;
@@ -134,7 +179,7 @@ function upload(entry, options) {
     const { crop_top, crop_bottom, remove_qr, mode, sample_interval } = options;
     request.open("POST", "/api/jobs?" + new URLSearchParams({ filename: entry.file.name, crop_top, crop_bottom, remove_qr, mode, sample_interval }));
     request.setRequestHeader("Content-Type", "application/octet-stream");
-    request.setRequestHeader("X-Upload-Token", document.querySelector('meta[name="upload-token"]').content);
+    request.setRequestHeader("X-Upload-Token", uploadToken);
     request.upload.addEventListener("progress", (event) => {
       if (event.lengthComputable) {
         const percent = Math.round(event.loaded / event.total * 100);
@@ -145,7 +190,7 @@ function upload(entry, options) {
     request.onload = () => {
       try {
         const result = JSON.parse(request.responseText);
-        if (request.status !== 202) throw new Error(result.error || "上传失败");
+        if (request.status !== 202) throw new ApiError(result.error || "上传失败", request.status);
         resolve(result);
       } catch (error) { reject(error); }
     };
@@ -155,13 +200,16 @@ function upload(entry, options) {
 }
 
 async function post(path, payload = {}) {
-  const response = await fetch(path, {
-    method: "POST", headers: { "Content-Type": "application/json", "X-Upload-Token": document.querySelector('meta[name="upload-token"]').content },
+  const send = () => requestJson(path, {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Upload-Token": uploadToken },
     body: JSON.stringify(payload),
   });
-  const result = await response.json();
-  if (!response.ok) throw new Error(result.error || "操作失败，请查看启动窗口中的日志。");
-  return result;
+  try { return await send(); }
+  catch (error) {
+    if (error.status !== 403) throw error;
+    await refreshSession();
+    return send();
+  }
 }
 
 async function openFolder(path) {
@@ -189,18 +237,24 @@ function showError(entry, error) {
   entry.status.textContent = error.message;
   entry.progress.hidden = true;
   entry.progressPanel.hidden = true;
+  entry.actions.replaceChildren();
+  if (canRetry(entry)) actionButton(entry, "重新加载并生成 PDF", () => retryEntry(entry));
+  updateCount();
 }
 
-async function poll(entry) {
-  try {
-    const response = await fetch(`/api/jobs/${entry.id}`);
-    if (!response.ok) throw new Error("无法读取任务。服务可能已重启，请重新添加视频。");
-    const job = await response.json();
+function schedulePoll(entry, delay) {
+  clearTimeout(entry.pollTimer);
+  entry.pollTimer = setTimeout(() => poll(entry), delay);
+}
+
+function renderJob(entry, job) {
     entry.state = job.status;
-    entry.log.textContent = job.log;
-    entry.details.hidden = !job.log;
+    entry.retryAvailable = job.retry_available !== false;
+    entry.log.textContent = [job.recovery_note, job.log].filter(Boolean).join("\n");
+    entry.details.hidden = !entry.log.textContent;
     entry.card.className = `job ${job.status}`;
-    entry.status.textContent = { queued: "已加入队列，等待处理…", running: "正在处理，下方显示当前阶段进度。", done: job.kind === "downloader" ? "下载器安装 / 更新完成" : `转换完成 · ${job.pages} 页`, review: `待人工检查 · ${job.pages} 张 PNG。打开目录删除多余页面后，确认生成 PDF。`, screenshots: `已保留 ${job.pages} 张 PNG，未生成 PDF`, error: "处理失败，请展开日志查看原因。" }[job.status];
+    entry.status.textContent = { queued: "已加入队列，等待处理…", running: "正在处理，下方显示当前阶段进度。", done: job.kind === "downloader" ? "下载器安装 / 更新完成" : `转换完成 · ${job.pages} 页`, review: `待人工检查 · ${job.pages} 张 PNG。打开目录删除多余页面后，确认生成 PDF。`, screenshots: `已保留 ${job.pages} 张 PNG，未生成 PDF`, interrupted: "上次处理已中断，可重新加载视频并生成 PDF。", error: "处理失败，请展开日志查看原因。" }[job.status];
+    if (job.retry_blocked_reason && ["error", "interrupted"].includes(job.status)) entry.status.textContent += " " + job.retry_blocked_reason;
     showJobProgress(entry, job);
     entry.actions.replaceChildren();
     if (job.status === "done") {
@@ -216,20 +270,131 @@ async function poll(entry) {
           await poll(entry);
         });
       }
-    } else if (job.status === "error") {
+    } else if (["error", "interrupted"].includes(job.status)) {
       entry.details.open = true;
-    } else if (job.status !== "screenshots") {
-      setTimeout(() => poll(entry), 1000);
+      if (canRetry(entry)) actionButton(entry, "重新加载并生成 PDF", () => retryEntry(entry));
     }
     if (job.kind !== "downloader") {
       actionButton(entry, job.screenshots_path ? "📂 打开截图 / 结果" : "📂 打开任务目录", () => openFolder(`/api/jobs/${entry.id}/open`));
     }
-  } catch (error) { showError(entry, error); }
+    updateCount();
 }
+
+async function poll(entry) {
+  clearTimeout(entry.pollTimer);
+  if (entry.polling) return;
+  entry.polling = true;
+  const id = entry.id;
+  try {
+    const job = await requestJson(`/api/jobs/${id}`);
+    if (entry.id !== id) return;
+    entry.connectionAttempts = 0;
+    renderJob(entry, job);
+    if (["queued", "running"].includes(job.status)) schedulePoll(entry, job.status === "queued" ? 5000 : 2000);
+  } catch (error) {
+    if (entry.id !== id) return;
+    if (error instanceof ConnectionError || error.status >= 500) {
+      entry.state = "connection";
+      entry.card.className = "job connection";
+      entry.status.textContent = "暂时无法获取状态，正在自动重连；后台任务可能仍在处理。";
+      entry.actions.replaceChildren();
+      actionButton(entry, "立即恢复状态", () => poll(entry));
+      entry.connectionAttempts = (entry.connectionAttempts || 0) + 1;
+      schedulePoll(entry, Math.min(30000, 2000 * entry.connectionAttempts));
+      updateCount();
+    } else showError(entry, error);
+  } finally { entry.polling = false; }
+}
+
+async function submitEntry(entry, options) {
+  entry.options = { ...options };
+  let job;
+  if (entry.kind === "file") {
+    try { job = await upload(entry, options); }
+    catch (error) {
+      if (error.status !== 403) throw error;
+      await refreshSession();
+      job = await upload(entry, options);
+    }
+  } else job = await post("/api/sources", { kind: entry.kind, source: entry.source, options });
+  entry.id = job.id;
+  entry.file = null; // Keep the File on failed uploads so one click can upload it again.
+  await poll(entry);
+}
+
+async function retryEntry(entry) {
+  if (entry.retrying) return;
+  entry.retrying = true;
+  clearTimeout(entry.pollTimer);
+  try {
+    // A connection problem may hide a successful result. Read its state before retrying.
+    if (entry.id) {
+      await poll(entry);
+      if (["connection", "queued", "running", "done", "review", "screenshots"].includes(entry.state)) return;
+      const job = await post(`/api/jobs/${entry.id}/retry`);
+      entry.id = job.id;
+      await poll(entry);
+    } else {
+      entry.state = "uploading";
+      entry.actions.replaceChildren();
+      entry.status.textContent = "正在重新加载视频…";
+      await submitEntry(entry, { ...entry.options, mode: "auto" });
+    }
+  } catch (error) { showError(entry, error); }
+  finally { entry.retrying = false; updateCount(); }
+}
+
+$("retry-failed").addEventListener("click", async () => {
+  if (retryingAll) return;
+  retryingAll = true;
+  const failed = entries.filter(canRetry);
+  updateCount();
+  try { for (const entry of failed) await retryEntry(entry); }
+  finally { retryingAll = false; updateCount(); }
+});
+
+async function restoreJobs() {
+  $("restore-jobs").disabled = true;
+  try {
+    let result;
+    let legacy = false;
+    let unavailable = 0;
+    try { result = await requestJson("/api/jobs"); }
+    catch (error) {
+      if (error.status !== 404 || !recoveryIds.length) throw error;
+      const responses = await Promise.allSettled(recoveryIds.map((id) => requestJson(`/api/jobs/${id}`)));
+      unavailable = responses.filter((response) => response.status === "rejected").length;
+      result = { jobs: responses.filter((response) => response.status === "fulfilled").map((response) => response.value) };
+      legacy = true;
+    }
+    const replaced = new Set(result.jobs.filter((job) => job.retry_job_id).map((job) => job.id));
+    for (const entry of [...entries]) {
+      if (!replaced.has(entry.id)) continue;
+      clearTimeout(entry.pollTimer);
+      entry.id = null;
+      entry.card.remove();
+      entries.splice(entries.indexOf(entry), 1);
+    }
+    for (const job of result.jobs) {
+      if (replaced.has(job.id)) continue;
+      const entry = entries.find((item) => item.id === job.id) || addEntry({ name: job.filename, kind: job.kind, id: job.id, state: job.status });
+      clearTimeout(entry.pollTimer);
+      renderJob(entry, job);
+      if (["queued", "running"].includes(job.status)) schedulePoll(entry, job.status === "queued" ? 5000 : 2000);
+    }
+    updateCount();
+    $("notice").textContent = `已恢复 ${result.jobs.length - replaced.size} 个任务；已完成的视频可直接下载，无需重新转换。${unavailable ? `还有 ${unavailable} 个任务暂时无法连接，可再次恢复列表。` : ""}${legacy ? "当前批次仍由旧版服务处理，请等本批完成后重启以使用文件夹识别和失败重试。" : ""}`;
+  } catch (error) {
+    $("notice").textContent = error.status === 404
+      ? "当前服务需要更新。请等本批转换结束后重新启动 start_web.bat，再点击“恢复任务列表”。"
+      : "暂时无法恢复任务列表，请确认服务启动后点击“恢复任务列表”。";
+  } finally { $("restore-jobs").disabled = false; }
+}
+$("restore-jobs").addEventListener("click", restoreJobs);
 
 $("choose").addEventListener("click", () => $("file-input").click());
 $("open-output").addEventListener("click", () => openFolder("/api/output/open"));
-const sourceKinds = ["files", "url", "local", "screenshots"];
+const sourceKinds = ["files", "url", "local", "folder", "screenshots"];
 function selectSource(kind) {
   for (const name of sourceKinds) {
     $("panel-" + name).hidden = name !== kind;
@@ -246,7 +411,7 @@ for (const kind of sourceKinds) {
     $("tab-" + sourceKinds[index]).focus();
   });
 }
-for (const [kind, field] of [["url", "video-urls"], ["local", "video-paths"], ["screenshots", "screenshots-path"]]) {
+for (const [kind, field] of [["url", "video-urls"], ["screenshots", "screenshots-path"]]) {
   $("add-" + kind).addEventListener("click", () => {
     const sources = $(field).value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
     if (!sources.length) { $("notice").textContent = "请先填写输入来源。"; return; }
@@ -259,6 +424,43 @@ for (const [kind, field] of [["url", "video-urls"], ["local", "video-paths"], ["
     $("notice").textContent = "";
   });
 }
+$("add-local").addEventListener("click", async () => {
+  const sources = $("video-paths").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+  if (!sources.length) { $("notice").textContent = "请填写视频文件或文件夹的完整路径。"; return; }
+  $("add-local").disabled = true;
+  const failures = [];
+  let added = 0;
+  for (const source of sources) {
+    try {
+      const result = await post("/api/local-sources", { source });
+      for (const video of result.videos) {
+        if (entries.some((entry) => entry.kind === "local" && entry.source === video && entry.state === "pending")) continue;
+        addEntry({ kind: "local", source: video, name: video });
+        added += 1;
+      }
+    } catch (error) { failures.push(`${source}：${error.message}`); }
+  }
+  $("add-local").disabled = false;
+  $("notice").textContent = `已识别并添加 ${added} 个视频。${added ? "点击“开始转换”即可批量生成 PDF。" : ""}${failures.join("；")}`;
+  if (!failures.length) $("video-paths").value = "";
+});
+$("scan-folder").addEventListener("click", async () => {
+  const source = $("video-folder").value.trim();
+  if (!source) { $("folder-feedback").textContent = "请先填写视频文件夹的完整路径。"; return; }
+  $("scan-folder").disabled = true;
+  $("folder-feedback").textContent = "正在扫描视频文件夹…";
+  try {
+    const result = await post("/api/video-folder", { source });
+    let added = 0;
+    for (const video of result.videos) {
+      if (entries.some((entry) => entry.kind === "local" && entry.source === video && entry.state === "pending")) continue;
+      addEntry({ kind: "local", source: video, name: video });
+      added += 1;
+    }
+    $("folder-feedback").textContent = `找到 ${result.videos.length} 个视频，新增 ${added} 个待处理任务。请点击下方“开始转换”；重复的待处理路径已跳过。`;
+  } catch (error) { $("folder-feedback").textContent = error.message; }
+  finally { $("scan-folder").disabled = false; }
+});
 $("setup-downloader").addEventListener("click", async () => {
   $("setup-downloader").disabled = true;
   try {
@@ -311,14 +513,11 @@ $("convert-form").addEventListener("submit", async (event) => {
     entry.status.textContent = entry.kind === "file" ? "正在上传…" : "正在提交…";
     setProgress(entry, entry.kind === "file" ? "上传到本机" : "提交任务", entry.kind === "file" ? "0%" : "请稍候", entry.kind === "file" ? 0 : null);
     try {
-      const job = entry.kind === "file" ? await upload(entry, options) : await post("/api/sources", {
-        kind: entry.kind, source: entry.source, options: { ...options, ...(entry.kind === "url" ? downloadOptions : {}) },
-      });
-      entry.id = job.id;
-      poll(entry);
+      await submitEntry(entry, { ...options, ...(entry.kind === "url" ? downloadOptions : {}) });
     } catch (error) { showError(entry, error); }
-    entry.file = null;
   }
   uploading = false;
   updateCount();
 });
+
+restoreJobs();

@@ -17,6 +17,7 @@
         <button id="tab-files" type="button" role="tab" aria-selected="true" aria-controls="panel-files">上传视频</button>
         <button id="tab-url" type="button" role="tab" aria-selected="false" aria-controls="panel-url">视频网址</button>
         <button id="tab-local" type="button" role="tab" aria-selected="false" aria-controls="panel-local">本地路径</button>
+        <button id="tab-folder" type="button" role="tab" aria-selected="false" aria-controls="panel-folder">视频文件夹</button>
         <button id="tab-screenshots" type="button" role="tab" aria-selected="false" aria-controls="panel-screenshots">已有 PNG 合成</button>
       </div>
       <div id="panel-files" role="tabpanel" aria-labelledby="tab-files">
@@ -48,9 +49,18 @@
         </details>
       </div>
       <div id="panel-local" class="source-panel" role="tabpanel" aria-labelledby="tab-local" hidden>
-        <label for="video-paths">本地视频完整路径 <small>每行一个，适合大文件，无需上传副本</small></label>
-        <textarea id="video-paths" rows="3" placeholder="F:\Download\课程\1.1.mp4"></textarea>
+        <label for="video-paths">本地视频或文件夹的完整路径 <small>每行一个，自动识别视频，无需手动选择文件</small></label>
+        <textarea id="video-paths" rows="3" placeholder="F:\Download\课程&#10;F:\Download\课程\1.1.mp4"></textarea>
+        <p class="hint">填写文件夹即可自动添加当前层的全部非空视频；也可填写单个视频路径。加入列表后点击“开始转换”。</p>
         <button id="add-local" type="button" class="secondary">添加本地路径</button>
+      </div>
+      <div id="panel-folder" class="source-panel" role="tabpanel" aria-labelledby="tab-folder" hidden>
+        <label for="video-folder">视频文件夹的完整路径</label>
+        <input id="video-folder" type="text" placeholder="F:\Download\课程">
+        <p class="hint">扫描当前文件夹中的视频，不包含子文件夹，跳过空文件和非视频文件。直接读取原视频，无需上传副本。</p>
+        <button id="scan-folder" type="button" class="secondary">扫描并加入列表</button>
+        <p id="folder-feedback" class="hint" role="status" aria-live="polite"></p>
+        <p class="hint">加入后，选择“自动生成 PDF，同时保留 PNG”并点击“开始转换”，每个视频生成一个独立 PDF。</p>
       </div>
       <div id="panel-screenshots" class="source-panel" role="tabpanel" aria-labelledby="tab-screenshots" hidden>
         <label for="screenshots-path">PNG 截图文件夹的完整路径</label>
@@ -74,7 +84,7 @@
       </form>
     </section>
     <p id="notice" class="notice" role="status" aria-live="polite"></p>
-    <section class="queue" aria-label="任务列表"><div class="queue-heading"><h2>任务列表</h2><span id="queue-count">0 个任务</span></div><p id="empty">添加视频或截图后，可在这里查看状态、检查截图、打开结果目录并下载 PDF。</p><div id="jobs"></div></section>
+    <section class="queue" aria-label="任务列表"><div class="queue-heading"><h2>任务列表</h2><span id="queue-count">0 个任务</span><div class="queue-actions"><button type="button" class="secondary" id="restore-jobs">恢复任务列表</button><button type="button" class="secondary" id="retry-failed" disabled>一键重试失败任务</button></div></div><p id="empty">添加视频或截图后，可在这里查看状态、检查截图、打开结果目录并下载 PDF。</p><div id="jobs"></div></section>
     <footer>逐个处理 · 本地 OCR · PNG / PDF 独立保存</footer>
   </main>
 </body>

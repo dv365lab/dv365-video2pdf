@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
@@ -17,10 +18,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
+from local_sources import VIDEO_EXTENSIONS, resolve_local_sources
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = PROJECT_ROOT / "web"
-VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v", ".wmv", ".mpg", ".mpeg", ".ts", ".mts", ".m2ts", ".flv"}
+CONVERSION_OPTION_KEYS = ('crop_top', 'crop_bottom', 'sample_interval', 'remove_qr', 'mode')
 
 
 def open_folder(path):
@@ -98,33 +101,168 @@ def parse_options(values):
 
 class WebServer(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 128
 
     def __init__(self, port, work_root):
         self.work_root = Path(work_root).resolve()
         self.work_root.mkdir(parents=True, exist_ok=True)
         self.upload_token = secrets.token_urlsafe(32)
         self.jobs = {}
-        self.lock = threading.Lock()
+        self.job_specs = {}
+        self.lock = threading.RLock()
         self.executor = ThreadPoolExecutor(max_workers=1)
         super().__init__(("127.0.0.1", port), RequestHandler)
+        self.load_jobs()
+
+    def persist_job(self, job_id):
+        """Called under the lock; never write URL/download credentials or CLI logs."""
+        job = self.jobs[job_id]
+        record = {key: value for key, value in job.items() if key not in ('log', 'progress')}
+        record['log'] = ''
+        record['progress'] = None
+        spec = self.job_specs.get(job_id)
+        saved_spec = None
+        if spec and job['kind'] in ('video', 'local', 'screenshots'):
+            saved_spec = dict(source=spec['source'], options={
+                key: spec['options'][key] for key in CONVERSION_OPTION_KEYS})
+        elif job['kind'] == 'url':
+            record['filename'] = '视频网址任务（重启前）'
+            record['retry_blocked_reason'] = '网址及下载凭据未保存；请重新添加视频网址后转换。'
+        folder = self.work_root / job_id
+        temporary = folder / 'job.json.tmp'
+        temporary.write_text(json.dumps(dict(version=1, job=record, spec=saved_spec),
+                                        ensure_ascii=False), encoding='utf-8')
+        temporary.replace(folder / 'job.json')
+
+    def load_jobs(self):
+        for folder in sorted(self.work_root.iterdir()):
+            if not re.fullmatch(r'[a-f0-9]{32}', folder.name) or not folder.is_dir() or folder.is_symlink():
+                continue
+            job, spec = None, None
+            metadata = folder / 'job.json'
+            if metadata.is_file():
+                try:
+                    record = json.loads(metadata.read_text(encoding='utf-8'))
+                    job = record['job']
+                    if (record.get('version') != 1 or job['id'] != folder.name
+                            or job['status'] not in ('queued', 'running', 'interrupted', 'error', 'done', 'review', 'screenshots')):
+                        raise ValueError('Invalid job metadata')
+                    saved_spec = record.get('spec')
+                    if saved_spec and job['kind'] in ('video', 'local', 'screenshots'):
+                        source = Path(saved_spec['source'])
+                        if not source.is_absolute():
+                            raise ValueError('Invalid source path')
+                        spec = dict(source=str(source), options=parse_options(saved_spec['options']))
+                except (OSError, ValueError, TypeError, KeyError):
+                    job, spec = None, None
+            if job is None:
+                # Earlier versions kept uploads, but neither source options nor job state.
+                sources = [p for p in folder.iterdir() if p.is_file()
+                           and p.suffix.lower() in VIDEO_EXTENSIONS and p.stat().st_size > 0]
+                if len(sources) != 1:
+                    continue
+                job = self.new_job(folder.name, sources[0].name, 'video')
+                job.update(status='interrupted', legacy=True,
+                           recovery_note='已恢复旧版上传视频；原裁剪、采样及去二维码参数未记录，重试将使用默认参数。')
+                spec = dict(source=str(sources[0]), options=parse_options({}))
+                pdf = self.recoverable_pdf(folder)
+                if pdf:
+                    screenshots = pdf.with_suffix('')
+                    job.update(status='done', download_url=f'/api/jobs/{folder.name}/pdf',
+                               screenshots_path=str(screenshots), pages=len(list(screenshots.glob('*.png'))))
+            elif job['status'] == 'done' and job['kind'] != 'downloader' and not self.recoverable_pdf(folder):
+                job.update(status='interrupted', download_url=None, pages=None, progress=None,
+                           recovery_note='原 PDF 不存在、已损坏或没有页面；可重试，重新读取原视频生成 PDF。')
+            if job['status'] in ('queued', 'running'):
+                job.update(status='interrupted', progress=None,
+                           recovery_note='上次服务在处理完成前停止；可点击重试，重新读取原视频并转换 PDF。')
+            self.jobs[folder.name] = job
+            if spec:
+                self.job_specs[folder.name] = spec
+            self.persist_job(folder.name)
+
+    @staticmethod
+    def recoverable_pdf(folder):
+        pdfs = [path for path in (folder / 'output').glob('*.pdf') if path.is_file()]
+        if len(pdfs) != 1:
+            return None
+        # A terminated CLI can leave a nonempty but truncated PDF behind.
+        import pikepdf
+        try:
+            with pikepdf.open(pdfs[0], attempt_recovery=False) as document:
+                return pdfs[0] if len(document.pages) else None
+        except (OSError, pikepdf.PdfError):
+            return None
+
+    @staticmethod
+    def new_job(job_id, filename, kind):
+        return dict(id=job_id, filename=filename, kind=kind, status='queued', log='',
+                    pages=None, download_url=None, screenshots_path=None, progress=None,
+                    created_at=time.time())
 
     def update(self, job_id, **values):
         with self.lock:
             self.jobs[job_id].update(values)
+            if any(key not in ('log', 'progress') for key in values):
+                self.persist_job(job_id)
 
     def snapshot(self, job_id):
         with self.lock:
             job = self.jobs.get(job_id)
-            return dict(job) if job else None
+            if not job:
+                return None
+            result = dict(job)
+            result['retry_available'] = job_id in self.job_specs and job['status'] in ('error', 'interrupted')
+            if not result['retry_available'] and job['status'] in ('error', 'interrupted'):
+                result.setdefault('retry_blocked_reason', '未保存可重试的视频来源；请重新添加。')
+            return result
 
-    def add_job(self, filename, kind='video', job_id=None):
+    def list_jobs(self):
+        with self.lock:
+            return [self.snapshot(job['id']) for job in sorted(self.jobs.values(), key=lambda job: job.get('created_at', 0))]
+
+    def add_job(self, filename, kind='video', job_id=None, source=None, options=None):
         job_id = job_id or uuid.uuid4().hex
         (self.work_root / job_id).mkdir(exist_ok=True)
-        job = dict(id=job_id, filename=filename, kind=kind, status='queued', log='',
-                   pages=None, download_url=None, screenshots_path=None, progress=None)
+        job = self.new_job(job_id, filename, kind)
         with self.lock:
             self.jobs[job_id] = job
+            if source is not None:
+                self.job_specs[job_id] = dict(source=str(source), options=dict(options or parse_options({})))
+            self.persist_job(job_id)
         return job_id
+
+    def retry_job(self, job_id):
+        with self.lock:
+            job = self.jobs[job_id]
+            if job['status'] in ('queued', 'running', 'done'):
+                return 200, self.snapshot(job_id)
+            successor = job.get('retry_job_id')
+            if successor in self.jobs:
+                return 202, self.snapshot(successor)
+            if job['status'] not in ('error', 'interrupted'):
+                raise ValueError('仅失败或中断的任务可以重新转换。')
+            spec = self.job_specs.get(job_id)
+            if not spec:
+                raise ValueError(job.get('retry_blocked_reason', '没有可恢复的视频来源，请重新添加视频。'))
+            source = spec['source']
+            if job['kind'] in ('video', 'local', 'screenshots'):
+                source = Path(source)
+                if job['kind'] == 'screenshots':
+                    if not source.is_dir() or not any(source.glob('*.png')):
+                        raise ValueError('原 PNG 文件夹不存在或已没有截图，请重新添加。')
+                elif not source.is_file() or not source.stat().st_size:
+                    raise ValueError('原视频不存在或为空，请恢复视频文件或重新添加。')
+            options = dict(spec['options'], mode='auto')
+            retry_id = self.add_job(job['filename'], job['kind'], source=source, options=options)
+            if job.get('legacy'):
+                self.update(retry_id, legacy=True, recovery_note=job['recovery_note'])
+            self.update(job_id, retry_job_id=retry_id)
+            if job['kind'] == 'screenshots':
+                self.executor.submit(self.import_screenshots, retry_id, source, 'auto')
+            else:
+                self.executor.submit(self.convert, retry_id, source, options)
+            return 202, self.snapshot(retry_id)
 
     def run_command(self, job_id, command, cwd):
         self.update(job_id, status='running', progress=None)
@@ -266,6 +404,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not self.allowed_request():
             return
         path = urlsplit(self.path).path
+        if path == '/api/session':
+            self.send_json(200, {'upload_token': self.server.upload_token})
+            return
+        if path == '/api/jobs':
+            self.send_json(200, {'jobs': self.server.list_jobs()})
+            return
         assets = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "text/javascript"), "/style.css": ("style.css", "text/css")}
         if path in assets:
             filename, content_type = assets[path]
@@ -355,12 +499,32 @@ class RequestHandler(BaseHTTPRequestHandler):
             folder.rmdir()
             self.send_json(400, {"error": str(error)})
             return
-        self.server.add_job(filename, job_id=job_id)
+        self.server.add_job(filename, job_id=job_id, source=source, options=options)
         self.server.executor.submit(self.server.convert, job_id, source, options)
         self.send_json(202, self.server.snapshot(job_id))
 
     def handle_action(self, path):
-        if path == '/api/output/open':
+        if path == '/api/local-sources':
+            self.send_json(200, {'videos': resolve_local_sources(self.read_json().get('source'))})
+        elif path == '/api/video-folder':
+            source = self.read_json().get('source')
+            if not isinstance(source, str) or not source.strip().strip('"'):
+                raise ValueError('请填写视频文件夹的完整路径。')
+            folder = Path(source.strip().strip('"')).expanduser()
+            if not folder.is_absolute():
+                raise ValueError('请输入本机文件夹的完整绝对路径。')
+            folder = folder.resolve()
+            if not folder.is_dir():
+                raise ValueError('视频文件夹不存在或路径不是文件夹。')
+            videos = sorted(
+                (file for file in folder.iterdir()
+                 if file.is_file() and file.suffix.lower() in VIDEO_EXTENSIONS and file.stat().st_size > 0),
+                key=lambda file: file.name.casefold(),
+            )
+            if not videos:
+                raise ValueError('该文件夹中没有非空视频文件；仅扫描当前层，不包含子文件夹。')
+            self.send_json(200, {'videos': [str(file) for file in videos]})
+        elif path == '/api/output/open':
             folder = PROJECT_ROOT / 'output'
             folder.mkdir(exist_ok=True)
             open_folder(folder)
@@ -392,20 +556,24 @@ class RequestHandler(BaseHTTPRequestHandler):
                 filename = source.name
             else:
                 raise ValueError('输入来源无效。')
-            job_id = self.server.add_job(filename, kind)
+            job_id = self.server.add_job(filename, kind, source=source, options=options)
             if kind == 'screenshots':
                 self.server.executor.submit(self.server.import_screenshots, job_id, source, options['mode'])
             else:
                 self.server.executor.submit(self.server.convert, job_id, source, options)
             self.send_json(202, self.server.snapshot(job_id))
         else:
-            match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/(open|review)', path)
+            match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/(open|review|retry)', path)
             if not match:
                 return False
             job_id, action = match.groups()
             job = self.server.snapshot(job_id)
             if not job:
                 self.send_json(404, {'error': '任务不存在。'})
+            elif action == 'retry':
+                self.read_json()
+                status, result = self.server.retry_job(job_id)
+                self.send_json(status, result)
             elif action == 'open':
                 folder = Path(job['screenshots_path']) if job['screenshots_path'] else self.server.work_root / job_id
                 open_folder(folder)
@@ -423,6 +591,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         raise ValueError('截图目录为空，请保留至少一张 PNG。')
                     current['status'] = 'queued' if choice == 'generate' else 'screenshots'
                     current['pages'] = len(list(Path(current['screenshots_path']).glob('*.png')))
+                    self.server.persist_job(job_id)
                 if choice == 'generate':
                     self.server.executor.submit(self.server.compose, job_id)
                 self.send_json(202 if choice == 'generate' else 200, self.server.snapshot(job_id))

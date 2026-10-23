@@ -34,6 +34,11 @@ async function run() {
   const jobs = new Map();
   const scheduledPolls = [];
   let nextJobState = null;
+  let pollFailure = null;
+  let failUpload = false;
+  let expireToken = false;
+  let restoredJobs = [];
+  let legacyListing = false;
   let sourceId = 0;
   class Upload {
     constructor() { this.upload = new Element(); }
@@ -41,23 +46,49 @@ async function run() {
     setRequestHeader() {}
     send(file) {
       requests.push({ url: this.url, file });
+      if (failUpload) { failUpload = false; this.onerror(); return; }
       this.status = 202;
       this.responseText = JSON.stringify({ id: String(requests.length) });
       this.onload();
     }
   }
+  const browserWindow = new Element();
+  browserWindow.location = {hash: "#jobs=" + "c".repeat(32) + ",invalid"};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8"), {
     document: { getElementById: getElement, createElement: () => new Element(), querySelector: () => ({ content: "token" }) },
-    window: new Element(),
+    window: browserWindow,
     XMLHttpRequest: Upload,
     URLSearchParams,
     URL,
-    setTimeout: (callback) => scheduledPolls.push(callback),
+    AbortController,
+    setTimeout: (callback, delay) => {
+      if (delay === 15000) return {};
+      scheduledPolls.push(callback);
+      return callback;
+    },
+    clearTimeout: (callback) => {
+      const index = scheduledPolls.indexOf(callback);
+      if (index !== -1) scheduledPolls.splice(index, 1);
+    },
     fetch: async (url, options) => {
-      if (options) {
+      if (options?.method === "POST") {
         const body = JSON.parse(options.body);
         apiRequests.push({ url, body, headers: options.headers });
         assert.equal(options.headers["X-Upload-Token"], "token");
+        if (expireToken) { expireToken = false; return { ok: false, status: 403, json: async () => ({error: "Expired token"}) }; }
+        if (url === "/api/local-sources") return { ok: true, json: async () => ({ videos: body.source === "F:/Batch" ? ["F:/Batch/one.mp4", "F:/Batch/two.avi"] : [body.source] }) };
+        if (url.endsWith("/retry")) {
+          const parent = jobs.get(url.replace("/retry", ""));
+          const id = "retry" + parent.id;
+          const retry = { ...parent, id, status: "done", download_url: `/api/jobs/${id}/pdf` };
+          jobs.set("/api/jobs/" + id, retry);
+          parent.retry_job_id = id;
+          return { ok: true, json: async () => retry };
+        }
+        if (url === "/api/video-folder") {
+          if (body.source === "missing") return { ok: false, json: async () => ({ error: "视频文件夹不存在" }) };
+          return { ok: true, json: async () => ({ videos: ["F:/课程/01.avi", "F:/课程/02.mp4"] }) };
+        }
         if (url.endsWith("/open")) return { ok: true, json: async () => ({ path: "F:/Projects/video2pdf/output" }) };
         if (url.endsWith("/review")) {
           const job = jobs.get(url.replace("/review", ""));
@@ -71,9 +102,15 @@ async function run() {
         jobs.set("/api/jobs/" + id, job);
         return { ok: true, json: async () => ({ id, kind, filename: job.filename }) };
       }
+      if (url === "/api/session") return { ok: true, json: async () => ({ upload_token: "token" }) };
+      if (url === "/api/jobs") return legacyListing
+        ? { ok: false, status: 404, json: async () => ({error:"旧服务"}) }
+        : { ok: true, json: async () => ({ jobs: restoredJobs }) };
+      if (pollFailure) { const error = pollFailure; pollFailure = null; throw error; }
       return { ok: true, json: async () => jobs.get(url) || ({ status: "done", pages: 2, log: "complete", download_url: url + "/pdf" }) };
     },
   });
+  await new Promise((resolve) => setImmediate(resolve));
   const drop = getElement("drop-zone").handlers.drop;
   drop({ preventDefault() {}, dataTransfer: {files: [{name: "invalid.txt", size: 10}]} });
   assert.equal(getElement("drop-title").textContent, "文件未添加成功");
@@ -137,7 +174,7 @@ async function run() {
   getElement("add-url").handlers.click();
   const urlCard = getElement("jobs").children.at(-1);
   getElement("video-paths").value = "F:\\Videos\\course.avi";
-  getElement("add-local").handlers.click();
+  await getElement("add-local").handlers.click();
   const localCard = getElement("jobs").children.at(-1);
   getElement("screenshots-path").value = "F:\\Slides\\1.1";
   getElement("add-screenshots").handlers.click();
@@ -182,6 +219,13 @@ async function run() {
   assert.equal(panel.hidden, false);
   assert.equal(panel.children[0].children[1].textContent, '42%');
   assert.equal(panel.children[1].value, 42);
+  pollFailure = new TypeError("Failed to fetch");
+  await scheduledPolls.shift()();
+  assert.notEqual(progressCard.className, "job error", "a disconnected poll is not a conversion failure");
+  assert.match(progressCard.children[0].children[1].children[1].textContent, /连接|重连/);
+  assert.equal(scheduledPolls.length, 1, "connection failure must continue polling");
+  await scheduledPolls.shift()();
+  assert.equal(progressCard.className, "job running");
   progressJob.progress = {stage:'clean', current:3, total:8, completed:2, percent:25};
   await scheduledPolls.shift()();
   assert.equal(panel.children[0].children[1].textContent, '第 3 / 8 页');
@@ -197,6 +241,83 @@ async function run() {
   await scheduledPolls.shift()();
   assert.equal(panel.hidden, true, 'an error must not retain a success progress display');
   assert.equal(scheduledPolls.length, 0);
+  nextJobState = null;
+  getElement("tab-folder").handlers.click();
+  assert.equal(getElement("panel-folder").hidden, false);
+  assert.equal(getElement("panel-url").hidden, true);
+  getElement("video-folder").value = "";
+  await getElement("scan-folder").handlers.click();
+  assert.match(getElement("folder-feedback").textContent, /请先填写/);
+  getElement("video-folder").value = "F:/课程";
+  const previousCardCount = getElement("jobs").children.length;
+  await getElement("scan-folder").handlers.click();
+  assert.equal(apiRequests.at(-1).body.source, "F:/课程");
+  assert.equal(getElement("jobs").children.length, previousCardCount + 2);
+  assert.match(getElement("folder-feedback").textContent, /找到 2 个视频，新增 2/);
+  await getElement("scan-folder").handlers.click();
+  assert.equal(getElement("jobs").children.length, previousCardCount + 2);
+  assert.match(getElement("folder-feedback").textContent, /新增 0/);
+  getElement("video-folder").value = "missing";
+  await getElement("scan-folder").handlers.click();
+  assert.match(getElement("folder-feedback").textContent, /视频文件夹不存在/);
+  assert.equal(getElement("scan-folder").disabled, false);
+  assert.equal(getElement("jobs").children.length, previousCardCount + 2);
+  await getElement("convert-form").handlers.submit({preventDefault() {}});
+  await new Promise((resolve) => setImmediate(resolve));
+  const folderRequests = apiRequests.filter((request) => request.url === "/api/sources").slice(-2);
+  assert.deepEqual(folderRequests.map((request) => request.body.source), ["F:/课程/01.avi", "F:/课程/02.mp4"]);
+  assert.ok(folderRequests.every((request) => request.body.kind === "local" && request.body.options.mode === "auto"));
+  for (const card of getElement("jobs").children.slice(-2)) {
+    assert.equal(card.className, "job done");
+    assert.equal(card.children[0].children[2].children[0].textContent, "下载 PDF ↓");
+  }
+  // A path can be a directory. Clicking Add resolves all videos without a file picker.
+  getElement("video-paths").value = "F:/Batch";
+  const beforeLocal = getElement("jobs").children.length;
+  expireToken = true;
+  await getElement("add-local").handlers.click();
+  assert.equal(getElement("jobs").children.length, beforeLocal + 2);
+  assert.match(getElement("notice").textContent, /添加 2 个视频/);
+  assert.equal(getElement("jobs").children.at(-1).children[0].children[1].children[0].textContent, "F:/Batch/two.avi");
+  nextJobState = {status: "error", retry_available: true};
+  await getElement("convert-form").handlers.submit({preventDefault() {}});
+  nextJobState = null;
+  const beforeRetries = apiRequests.filter((request) => request.url.endsWith("/retry")).length;
+  await getElement("retry-failed").handlers.click();
+  assert.equal(apiRequests.filter((request) => request.url.endsWith("/retry")).length, beforeRetries + 3);
+  assert.equal(progressCard.className, "job done", "bulk retry includes the previous failed conversion");
+  assert.equal(getElement("retry-failed").disabled, true);
+  for (const card of getElement("jobs").children.slice(-2)) assert.equal(card.className, "job done");
+
+  // A failed upload keeps the selected File, and retry automatically requests a PDF.
+  failUpload = true;
+  const retryFile = {name: "upload-retry.avi", size: 120};
+  getElement("file-input").handlers.change({target: {files: [retryFile]}});
+  getElement("output-mode").value = "png";
+  await getElement("convert-form").handlers.submit({preventDefault() {}});
+  const uploadCard = getElement("jobs").children.at(-1);
+  assert.equal(uploadCard.className, "job error");
+  await uploadCard.children[0].children[2].children[0].handlers.click();
+  assert.equal(requests.at(-1).file, retryFile);
+  assert.equal(new URL("http://localhost" + requests.at(-1).url).searchParams.get("mode"), "auto");
+  assert.equal(uploadCard.className, "job done");
+
+  // Refresh recovers jobs without re-submitting successful videos or showing retry parents.
+  const restored = {id: "restored", filename:"已完成.mp4", kind:"local", status:"done", pages:4, download_url:"result.pdf", log:""};
+  restoredJobs = [{...restored, id: "parent", status:"error", retry_job_id:"restored"}, restored];
+  const cardsBeforeRestore = getElement("jobs").children.length;
+  const postsBeforeRestore = apiRequests.length;
+  await getElement("restore-jobs").handlers.click();
+  await getElement("restore-jobs").handlers.click();
+  assert.equal(getElement("jobs").children.length, cardsBeforeRestore + 1);
+  assert.equal(apiRequests.length, postsBeforeRestore);
+  assert.equal(getElement("jobs").children.at(-1).className, "job done");
+  legacyListing = true;
+  jobs.set("/api/jobs/" + "c".repeat(32), {...restored, id:"c".repeat(32), filename:"旧批次.mp4"});
+  await getElement("restore-jobs").handlers.click();
+  assert.match(getElement("notice").textContent, /已恢复 1 个任务.*旧版服务/);
+  assert.equal(getElement("jobs").children.at(-1).className, "job done");
+  assert.equal(apiRequests.length, postsBeforeRestore, "recovery of an old batch must never restart conversion");
   console.log("Uploads, drop feedback, stage percentages, page counts, review and folder actions: passed");
 }
 

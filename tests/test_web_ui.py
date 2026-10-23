@@ -158,6 +158,67 @@ class WebUITests(unittest.TestCase):
         self.assertEqual((self.root / 'source.avi').read_bytes(), original)
         self.assertFalse(list((self.root / 'jobs' / job['id']).glob('*.avi')))
 
+    def test_video_folder_scan_filters_and_does_not_start_jobs(self):
+        folder = self.root / '课程 videos'
+        folder.mkdir()
+        for name in ['02.MP4', '01.avi', 'notes.txt']:
+            (folder / name).write_bytes(b'content')
+        (folder / 'empty.mp4').touch()
+        (folder / 'nested.mp4').mkdir()
+        (folder / 'nested.mp4' / 'nested.avi').write_bytes(b'content')
+        status, result = self.post_json('/api/video-folder', {'source': f' "{folder}" '})
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result['videos'], [str(folder / '01.avi'), str(folder / '02.MP4')])
+        self.assertEqual(self.server.jobs, {})
+
+    def test_local_sources_api_resolves_both_directory_and_video(self):
+        self.make_video()
+        for source in [str(self.root / 'source.avi'), str(self.root)]:
+            status, result = self.post_json('/api/local-sources', {'source': source})
+            self.assertEqual(status, 200, result)
+            self.assertEqual(result['videos'], [str(self.root / 'source.avi')])
+        self.assertEqual(self.server.jobs, {})
+        status, _, _ = self.request('POST', '/api/local-sources', b'{}')
+        self.assertEqual(status, 403)
+
+    def test_video_folder_rejects_missing_empty_and_relative_paths(self):
+        file = self.root / 'file.mp4'
+        file.write_bytes(b'content')
+        empty = self.root / 'empty'
+        empty.mkdir()
+        for source in ['', None, [], 'relative/path', str(file), str(empty), str(self.root / 'missing')]:
+            with self.subTest(source=source):
+                status, result = self.post_json('/api/video-folder', {'source': source})
+                self.assertEqual(status, 400, result)
+                self.assertTrue(result['error'])
+        self.assertEqual(self.server.jobs, {})
+
+    def test_folder_batch_creates_one_pdf_per_video_and_continues_after_failure(self):
+        folder = self.root / '批量 视频'
+        folder.mkdir()
+        video = self.make_video()
+        (folder / '01.avi').write_bytes(video)
+        (folder / '02-broken.mp4').write_bytes(b'broken')
+        (folder / '03.avi').write_bytes(video)
+        status, scan = self.post_json('/api/video-folder', {'source': str(folder)})
+        self.assertEqual(status, 200, scan)
+        jobs = []
+        for source in scan['videos']:
+            status, job = self.post_json('/api/sources', {'kind': 'local', 'source': source})
+            self.assertEqual(status, 202, job)
+            jobs.append(job)
+        results = [self.wait_for_job(job['id']) for job in jobs]
+        self.assertEqual([job['status'] for job in results], ['done', 'error', 'done'], results)
+        for job, name in [(results[0], '01'), (results[2], '03')]:
+            pdfs = list((self.root / 'jobs' / job['id'] / 'output').glob('*.pdf'))
+            self.assertEqual([pdf.name for pdf in pdfs], [name + '.pdf'])
+            with pikepdf.open(pdfs[0]) as document:
+                self.assertEqual(len(document.pages), 1)
+            self.assertEqual(self.request('GET', job['download_url'])[0], 200)
+            self.assertEqual((folder / (name + '.avi')).read_bytes(), video)
+            self.assertFalse(list((self.root / 'jobs' / job['id']).glob('*.avi')))
+        self.assertEqual(len(list(folder.iterdir())), 3)
+
     def test_url_and_download_options_are_validated_and_queued(self):
         options = {'referer': 'https://play.vidyard.com/', 'cookies_from_browser': 'edge:Default',
                    'add_headers': ['Authorization: Bearer test'], 'mode': 'review', 'sample_interval': 0.5}
