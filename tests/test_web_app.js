@@ -39,6 +39,8 @@ async function run() {
   let expireToken = false;
   let restoredJobs = [];
   let legacyListing = false;
+  let localSourceStatus = 200;
+  let releaseLocalScan = null;
   let sourceId = 0;
   class Upload {
     constructor() { this.upload = new Element(); }
@@ -76,7 +78,11 @@ async function run() {
         apiRequests.push({ url, body, headers: options.headers });
         assert.equal(options.headers["X-Upload-Token"], "token");
         if (expireToken) { expireToken = false; return { ok: false, status: 403, json: async () => ({error: "Expired token"}) }; }
-        if (url === "/api/local-sources") return { ok: true, json: async () => ({ videos: body.source === "F:/Batch" ? ["F:/Batch/one.mp4", "F:/Batch/two.avi"] : [body.source] }) };
+        if (url === "/api/local-sources") {
+          if (localSourceStatus === 404) return {ok:false,status:404,json:async()=>({error:"接口不存在。"})};
+          if (localSourceStatus === "pending") await new Promise((resolve) => { releaseLocalScan = resolve; });
+          return { ok: true, json: async () => ({ videos: body.source === "F:/Batch" ? ["F:/Batch/one.mp4", "F:/Batch/two.avi"] : [body.source] }) };
+        }
         if (url.endsWith("/retry")) {
           const parent = jobs.get(url.replace("/retry", ""));
           const id = "retry" + parent.id;
@@ -272,12 +278,31 @@ async function run() {
     assert.equal(card.children[0].children[2].children[0].textContent, "下载 PDF ↓");
   }
   // A path can be a directory. Clicking Add resolves all videos without a file picker.
+  getElement("video-paths").value = "";
+  const beforeEmptyRequest = apiRequests.length;
+  await getElement("add-local").handlers.click();
+  assert.match(getElement("local-feedback").textContent, /示例.*实际路径/);
+  assert.equal(apiRequests.length, beforeEmptyRequest);
+  localSourceStatus = 404;
+  getElement("video-paths").value = "F:/MissingBackend";
+  await getElement("add-local").handlers.click();
+  assert.match(getElement("local-feedback").textContent, /本批.*重启.*start_web.bat/);
+  assert.match(getElement("local-feedback").textContent, /刷新网页/);
+  assert.equal(getElement("video-paths").value, "F:/MissingBackend");
+  assert.equal(getElement("add-local").disabled, false);
   getElement("video-paths").value = "F:/Batch";
   const beforeLocal = getElement("jobs").children.length;
   expireToken = true;
-  await getElement("add-local").handlers.click();
+  localSourceStatus = "pending";
+  const pendingScan = getElement("add-local").handlers.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(getElement("add-local").disabled, true);
+  assert.match(getElement("local-feedback").textContent, /正在识别/);
+  releaseLocalScan();
+  await pendingScan;
+  localSourceStatus = 200;
   assert.equal(getElement("jobs").children.length, beforeLocal + 2);
-  assert.match(getElement("notice").textContent, /添加 2 个视频/);
+  assert.match(getElement("local-feedback").textContent, /添加 2 个视频/);
   assert.equal(getElement("jobs").children.at(-1).children[0].children[1].children[0].textContent, "F:/Batch/two.avi");
   nextJobState = {status: "error", retry_available: true};
   await getElement("convert-form").handlers.submit({preventDefault() {}});

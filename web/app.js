@@ -426,8 +426,9 @@ for (const [kind, field] of [["url", "video-urls"], ["screenshots", "screenshots
 }
 $("add-local").addEventListener("click", async () => {
   const sources = $("video-paths").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
-  if (!sources.length) { $("notice").textContent = "请填写视频文件或文件夹的完整路径。"; return; }
+  if (!sources.length) { $("local-feedback").textContent = "灰色内容只是示例，请先粘贴视频文件或文件夹的实际路径。"; return; }
   $("add-local").disabled = true;
+  $("local-feedback").textContent = "正在识别本地视频，请稍候…";
   const failures = [];
   let added = 0;
   for (const source of sources) {
@@ -438,10 +439,16 @@ $("add-local").addEventListener("click", async () => {
         addEntry({ kind: "local", source: video, name: video });
         added += 1;
       }
-    } catch (error) { failures.push(`${source}：${error.message}`); }
+    } catch (error) {
+      if (error.status === 404) {
+        failures.push("当前后台仍是旧版本，刷新网页不能加载新接口。请等本批转换完成后重启 start_web.bat，再刷新网页。");
+        break;
+      }
+      failures.push(`${source}：${error.message}`);
+    }
   }
   $("add-local").disabled = false;
-  $("notice").textContent = `已识别并添加 ${added} 个视频。${added ? "点击“开始转换”即可批量生成 PDF。" : ""}${failures.join("；")}`;
+  $("local-feedback").textContent = `${added ? `已识别并添加 ${added} 个视频。点击“开始转换”即可批量生成 PDF。` : "未新增视频。"}${failures.join("；")}`;
   if (!failures.length) $("video-paths").value = "";
 });
 $("scan-folder").addEventListener("click", async () => {
