@@ -65,6 +65,9 @@ async function run() {
   let localSourceStatus = 200;
   let releaseLocalScan = null;
   let sourceId = 0;
+  let deleteFailure = false;
+  let deletionPending = false;
+  let releaseDeletion = null;
   class Upload {
     constructor() { this.upload = new Element(); }
     open(method, url) { this.url = url; }
@@ -119,6 +122,15 @@ async function run() {
         apiRequests.push({ url, body, headers: options.headers });
         assert.equal(options.headers["X-Upload-Token"], "token");
         if (expireToken) { expireToken = false; return { ok: false, status: 403, json: async () => ({error: "Expired token"}) }; }
+        if (url === "/api/jobs/completed/delete") {
+          if (deletionPending) await new Promise((resolve) => { releaseDeletion = resolve; });
+          if (deleteFailure) return {ok: false, status: 500, json: async () => ({error: "任务记录暂时无法写入。"})};
+          const deleted = new Set([...requests.map((_, index) => String(index + 1)),
+            ...[...jobs.values(), ...restoredJobs].filter((job) => ["done", "screenshots"].includes(job.status)).map((job) => job.id)]);
+          restoredJobs = restoredJobs.filter((job) => !deleted.has(job.id));
+          for (const [key, job] of jobs) if (deleted.has(job.id)) jobs.delete(key);
+          return {ok: true, json: async () => ({deleted_ids: [...deleted], failed_ids: []})};
+        }
         if (url === "/api/local-sources") {
           if (localSourceStatus === 404) return {ok:false,status:404,json:async()=>({error:"接口不存在。"})};
           if (localSourceStatus === "pending") await new Promise((resolve) => { releaseLocalScan = resolve; });
@@ -159,6 +171,7 @@ async function run() {
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(getElement("download-all").disabled, true, "no PDF is ready initially");
+  assert.equal(getElement("delete-completed").disabled, true, "no completed record can be deleted initially");
   const initialElements = createdElements.length;
   getElement("download-all").handlers.click();
   assert.equal(createdElements.length, initialElements, "disabled download must not start a request");
@@ -456,6 +469,40 @@ async function run() {
   assert.match(getElement("notice").textContent, /已恢复 1 个任务.*旧版服务/);
   assert.equal(getElement("jobs").children.at(-1).className, "job done");
   assert.equal(apiRequests.length, postsBeforeRestore, "recovery of an old batch must never restart conversion");
+
+  legacyListing = false;
+  getElement("file-input").handlers.change({target: {files: [{name: "pending.avi", size: 120}]}});
+  const pendingCard = getElement("jobs").children.at(-1);
+  restoredJobs.push({id: "still-running", filename: "running.avi", kind: "local", status: "running"},
+    {id: "still-failed", filename: "failed.avi", kind: "local", status: "error"});
+  await getElement("restore-jobs").handlers.click();
+  const cards = getElement("jobs").children.filter((card) => !card.removed);
+  const completedCards = cards.filter((card) => ["job done", "job screenshots"].includes(card.className));
+  assert.equal(getElement("delete-completed").textContent, `删除已完成任务（${completedCards.length}）`);
+  deleteFailure = true;
+  await getElement("delete-completed").handlers.click();
+  assert.ok(completedCards.every((card) => !card.removed), "failed deletion must keep the displayed records");
+  assert.match(getElement("notice").textContent, /暂时无法写入/);
+  assert.equal(getElement("delete-completed").disabled, false);
+  deleteFailure = false;
+  deletionPending = true;
+  const deleting = getElement("delete-completed").handlers.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(getElement("delete-completed").disabled, true);
+  const deleteRequests = apiRequests.filter((request) => request.url === "/api/jobs/completed/delete").length;
+  await getElement("delete-completed").handlers.click();
+  assert.equal(apiRequests.filter((request) => request.url === "/api/jobs/completed/delete").length, deleteRequests);
+  releaseDeletion();
+  await deleting;
+  assert.ok(completedCards.every((card) => card.removed));
+  assert.ok(cards.filter((card) => !completedCards.includes(card)).every((card) => !card.removed));
+  assert.equal(pendingCard.removed, undefined);
+  assert.equal(getElement("queue-count").textContent, `${cards.length - completedCards.length} 个任务`);
+  assert.equal(getElement("download-all").disabled, true);
+  assert.equal(getElement("delete-completed").disabled, true);
+  assert.match(getElement("notice").textContent, /文件.*保留/);
+  await getElement("restore-jobs").handlers.click();
+  assert.equal(getElement("delete-completed").disabled, true, "deleted records must not reappear on restore");
   console.log("Uploads, drop feedback, stage percentages, page counts, review and folder actions: passed");
 }
 

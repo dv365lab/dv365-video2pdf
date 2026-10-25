@@ -149,6 +149,8 @@ class WebServer(ThreadingHTTPServer):
                     if (record.get('version') != 1 or job['id'] != folder.name
                             or job['status'] not in ('queued', 'running', 'interrupted', 'error', 'done', 'review', 'screenshots')):
                         raise ValueError('Invalid job metadata')
+                    if job.get('deleted') is True:
+                        continue
                     saved_spec = record.get('spec')
                     if saved_spec and job['kind'] in ('video', 'local', 'screenshots'):
                         source = Path(saved_spec['source'])
@@ -222,6 +224,25 @@ class WebServer(ThreadingHTTPServer):
     def list_jobs(self):
         with self.lock:
             return [self.snapshot(job['id']) for job in sorted(self.jobs.values(), key=lambda job: job.get('created_at', 0))]
+
+    def delete_completed_jobs(self):
+        deleted, failed = [], []
+        with self.lock:
+            completed = [job_id for job_id, job in self.jobs.items()
+                         if job['status'] in ('done', 'screenshots')]
+            for job_id in completed:
+                job = self.jobs[job_id]
+                job['deleted'] = True
+                try:
+                    self.persist_job(job_id)
+                except OSError:
+                    job.pop('deleted', None)
+                    failed.append(job_id)
+                    continue
+                del self.jobs[job_id]
+                self.job_specs.pop(job_id, None)
+                deleted.append(job_id)
+        return {'deleted_ids': deleted, 'failed_ids': failed}
 
     def add_job(self, filename, kind='video', job_id=None, source=None, options=None):
         job_id = job_id or uuid.uuid4().hex
@@ -543,7 +564,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_json(202, self.server.snapshot(job_id))
 
     def handle_action(self, path):
-        if path == '/api/local-sources':
+        if path == '/api/jobs/completed/delete':
+            self.read_json()
+            self.send_json(200, self.server.delete_completed_jobs())
+        elif path == '/api/local-sources':
             self.send_json(200, {'videos': resolve_local_sources(self.read_json().get('source'))})
         elif path == '/api/video-folder':
             source = self.read_json().get('source')

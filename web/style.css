@@ -70,6 +70,7 @@ input[type=checkbox] { width: 17px; height: 17px; accent-color: var(--green); }
 .queue-heading { flex-wrap: wrap; gap: 12px; }
 .queue-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .queue-actions button { font-size: 12px; padding: 8px 10px; }
+.queue-actions .danger { color: #a3473d; border-color: #e4c5bf; }
 .job.connection .status { color: #8b651c; }
 #empty { color: var(--muted); text-align: center; padding: 25px 10px; font-size: 12px; border-bottom: 1px solid var(--line); }
 .job { margin-top: 12px; border: 1px solid var(--line); border-radius: 10px; background: #fff; padding: 16px; }

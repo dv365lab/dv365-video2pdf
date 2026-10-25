@@ -73,6 +73,71 @@ class WebRecoveryTests(unittest.TestCase):
         self.assertEqual(submit.call_args.args[2], source)
         self.assertEqual(submit.call_args.args[3]['crop_top'], 7)
 
+    def test_delete_completed_only_removes_successful_records_and_is_idempotent(self):
+        ids = {}
+        for state in ('done', 'screenshots', 'queued', 'running', 'review', 'error', 'interrupted'):
+            job_id = self.server.add_job(state, source=self.root / 'source.avi')
+            self.server.update(job_id, status=state)
+            ids[state] = job_id
+        status, result = self.request('POST', '/api/jobs/completed/delete')
+        self.assertEqual(status, 200, result)
+        self.assertEqual(set(result['deleted_ids']), {ids['done'], ids['screenshots']})
+        self.assertEqual(result['failed_ids'], [])
+        for state, job_id in ids.items():
+            if state in ('done', 'screenshots'):
+                self.assertIsNone(self.server.snapshot(job_id))
+                self.assertNotIn(job_id, self.server.job_specs)
+                self.assertEqual(self.request('GET', '/api/jobs/' + job_id)[0], 404)
+            else:
+                self.assertEqual(self.server.snapshot(job_id)['status'], state)
+                self.assertIn(job_id, self.server.job_specs)
+        self.assertEqual(self.request('POST', '/api/jobs/completed/delete'),
+                         (200, {'deleted_ids': [], 'failed_ids': []}))
+
+    def test_deleted_records_stay_deleted_after_restart_and_keep_every_file(self):
+        source, job = self.add_local()
+        folder = self.root / 'jobs' / job['id']
+        output = folder / 'output'
+        output.mkdir()
+        assets = {source: source.read_bytes(), folder / 'uploaded.avi': b'uploaded video',
+                  output / 'result.pdf': b'preserved PDF', output / '0000.png': b'preserved PNG'}
+        for path, content in assets.items():
+            path.write_bytes(content)
+        self.server.update(job['id'], status='done')
+        self.assertEqual(self.request('POST', '/api/jobs/completed/delete')[0], 200)
+        self.assertEqual(self.request('GET', '/api/jobs')[1]['jobs'], [])
+        restarted = self.start_server()
+        self.assertEqual(self.request('GET', '/api/jobs', server=restarted)[1]['jobs'], [])
+        for path, content in assets.items():
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_delete_completed_keeps_records_when_persistence_fails(self):
+        successful = self.server.add_job('successful')
+        failed = self.server.add_job('failed')
+        for job_id in (successful, failed):
+            self.server.update(job_id, status='done')
+        persist = self.server.persist_job
+        def fail_one(job_id):
+            if job_id == failed:
+                raise PermissionError('read-only metadata')
+            return persist(job_id)
+        with patch.object(self.server, 'persist_job', side_effect=fail_one):
+            status, result = self.request('POST', '/api/jobs/completed/delete')
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result, {'deleted_ids': [successful], 'failed_ids': [failed]})
+        self.assertIsNone(self.server.snapshot(successful))
+        self.assertNotIn('deleted', self.server.snapshot(failed))
+        restarted = self.start_server()
+        self.assertNotIn(successful, restarted.jobs)
+        self.assertIn(failed, restarted.jobs)
+
+    def test_delete_completed_requires_valid_token(self):
+        job_id = self.server.add_job('finished')
+        self.server.update(job_id, status='done')
+        status, _ = self.request('POST', '/api/jobs/completed/delete', token='invalid')
+        self.assertEqual(status, 403)
+        self.assertIsNotNone(self.server.snapshot(job_id))
+
     def test_retry_reads_original_source_preserves_options_and_forces_pdf(self):
         source, job = self.add_local({'crop_top': 3, 'crop_bottom': 4, 'sample_interval': 0.5,
                                       'remove_qr': True, 'mode': 'review'})

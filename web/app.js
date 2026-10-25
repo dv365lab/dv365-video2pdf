@@ -8,6 +8,8 @@ let rejectedFiles = [];
 let uploadToken = document.querySelector('meta[name="upload-token"]').content;
 let retryingAll = false;
 let downloadingAll = false;
+let deletingCompleted = false;
+const deletedJobIds = new Set();
 let activeRequests = 0;
 const requestWaiters = [];
 // A recovery link can reconnect a pre-upgrade batch without stopping its server.
@@ -61,6 +63,9 @@ function updateCount() {
   const completed = entries.filter((entry) => entry.state === "done" && entry.downloadUrl).length;
   $("download-all").disabled = !completed || downloadingAll;
   $("download-all").textContent = downloadingAll ? "正在准备浏览器下载…" : `打包下载全部 PDF${completed ? `（${completed}）` : ""}`;
+  const removable = entries.filter((entry) => entry.id && ["done", "screenshots"].includes(entry.state)).length;
+  $("delete-completed").disabled = !removable || deletingCompleted;
+  $("delete-completed").textContent = deletingCompleted ? "正在删除任务记录…" : `删除已完成任务${removable ? `（${removable}）` : ""}`;
   updateDropFeedback();
 }
 
@@ -372,6 +377,7 @@ async function restoreJobs() {
       result = { jobs: responses.filter((response) => response.status === "fulfilled").map((response) => response.value) };
       legacy = true;
     }
+    result.jobs = result.jobs.filter((job) => !deletedJobIds.has(job.id));
     const replaced = new Set(result.jobs.filter((job) => job.retry_job_id).map((job) => job.id));
     for (const entry of [...entries]) {
       if (!replaced.has(entry.id)) continue;
@@ -396,6 +402,32 @@ async function restoreJobs() {
   } finally { $("restore-jobs").disabled = false; }
 }
 $("restore-jobs").addEventListener("click", restoreJobs);
+$("delete-completed").addEventListener("click", async () => {
+  if ($("delete-completed").disabled) return;
+  deletingCompleted = true;
+  updateCount();
+  $("notice").textContent = "正在删除已完成的任务记录，文件会保留…";
+  try {
+    const result = await post("/api/jobs/completed/delete");
+    const deleted = new Set(result.deleted_ids);
+    for (const id of deleted) deletedJobIds.add(id);
+    for (const entry of [...entries]) {
+      if (!deleted.has(entry.id)) continue;
+      clearTimeout(entry.pollTimer);
+      entry.id = null;
+      entry.card.remove();
+      entries.splice(entries.indexOf(entry), 1);
+    }
+    $("notice").textContent = `已删除 ${deleted.size} 个已完成任务的记录，PDF、PNG 和视频文件全部保留。${result.failed_ids.length ? `另有 ${result.failed_ids.length} 个记录删除失败，请重试。` : ""}`;
+  } catch (error) {
+    $("notice").textContent = error.status === 404
+      ? "当前后台尚未加载批量删除功能，请重新启动 start_web.bat 后刷新页面；文件不会被删除。"
+      : error.message;
+  } finally {
+    deletingCompleted = false;
+    updateCount();
+  }
+});
 $("download-all").addEventListener("click", async () => {
   if ($("download-all").disabled) return;
   downloadingAll = true;
