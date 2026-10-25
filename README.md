@@ -122,7 +122,7 @@ Pillow、pikepdf、ONNX Runtime 等间接依赖会随上述依赖安装。OCR �
 2. 按需设置顶部/底部裁剪、采样间隔和「自动移除二维码」。这些选项用于本次提交的视频；已有 PNG 按文件名排序合成，不重复裁剪或去二维码。PDF 品牌文字清理默认开启，界面列出移除范围。
 3. 选择输出方式：「自动生成 PDF，同时保留 PNG」「先检查 PNG，再确认生成 PDF」或「仅保存 PNG，暂不生成 PDF」，点击「开始转换」。
 4. 人工检查任务显示「打开截图 / 结果」「确认生成 PDF」「仅保留 PNG」。可先打开目录删除多余截图，再确认合成；等待检查期间其他任务照常处理。目录为空时会提示保留至少一张 PNG。
-5. 完成后可下载 PDF 或打开任务结果目录。页面右上角的文件夹图标「打开 output」会在系统文件管理器中打开项目输出目录；打开失败会在页面显示原因。
+5. 完成后可下载单个 PDF，或点击任务列表旁的「打包下载全部 PDF」一次下载所有已完成结果的 ZIP（含恢复的历史任务；同名 PDF 自动编号，跳过失败、未完成和仅 PNG 的任务）。Chrome / Edge 会弹出浏览器保存窗口，选择位置后直接写入磁盘，支持大批量 PDF；其他浏览器获取 ZIP 后使用浏览器下载。获取期间按钮显示等待状态，失败时在页面提示。没有可下载的 PDF 时按钮不可用。也可打开任务结果目录；页面右上角的文件夹图标「打开 output」会在系统文件管理器中打开项目输出目录，打开失败会在页面显示原因。
 
 「视频网址」中的「下载设置与下载器」提供 Referer、浏览器 Cookie 来源、附加请求头（每行 `名称:值`），以及「安装 / 更新下载器」按钮。Vidyard 的 Referer 与主播放列表仍自动处理。Cookie 来源留空时不读取浏览器登录信息；这些下载设置只传给网址任务。下载器安装进度和错误显示在任务日志中。
 
@@ -177,18 +177,18 @@ Web UI 使用原有截图算法，支持 MP4、AVI、MOV、MKV、WebM 等常见�
 
 网址下载优先使用 **项目内的 `.tools/yt-dlp.exe`**；未安装时才查找 PATH。下载器版本必须为 **2026.08.19 或更新版本**，较旧版本使用的 YouTube 客户端会遇到 HTTP 403（见 [官方修复记录](https://github.com/yt-dlp/yt-dlp/releases/tag/2026.08.19)）。截图仍使用项目的 Python 3.9。
 
-本机已安装并验证项目内的 `2026.08.19`。首次配置或修复旧版本时，在项目目录运行：
+首次配置或修复旧版本时，在项目目录运行（Web UI 也可点击「安装 / 更新下载器」）：
 
 ```powershell
 .\.venv\Scripts\python.exe setup_downloader.py
 ```
 
-安装脚本从官方 GitHub 下载独立版，核对官方 SHA-256 后再替换项目内的下载器；失败会保留现有文件。该命令不会修改全局 Python 或 PATH。`setup_downloader.py` 的 `VERSION` 固定为本项目验证过的版本。
+安装脚本从官方 GitHub 下载最新稳定独立版，核对官方 SHA-256 后再替换项目内的下载器；失败会保留现有文件。该命令不会修改全局 Python 或 PATH，不再固定安装旧版本。
 
 其他安装方式和依赖说明：
 
 - 从 [yt-dlp 官方安装说明](https://github.com/yt-dlp/yt-dlp#installation) 下载 Windows 独立版 `yt-dlp.exe`，将所在目录加入 PATH。当前 yt-dlp Python 包要求 Python 3.10 以上，因此不在本项目 Python 3.9 的 `requirements.txt` 中安装。
-- YouTube 需要 JavaScript 运行时，推荐按 [官方 EJS 说明](https://github.com/yt-dlp/yt-dlp/wiki/EJS) 安装 Deno。Windows 可以将 `deno.exe` 放在 `yt-dlp.exe` 同目录或加入 PATH；独立版 yt-dlp 已包含所需的 EJS 脚本。使用 pip 安装 yt-dlp 时，请在其兼容的 Python 环境中安装 `yt-dlp[default]`。
+- YouTube 需要 JavaScript 运行时，推荐按 [官方 EJS 说明](https://github.com/yt-dlp/yt-dlp/wiki/EJS) 安装 Deno。Windows 可以将 `deno.exe` 放在 `yt-dlp.exe` 同目录或加入 PATH；程序会显式传递其绝对路径，避免 Web 任务工作目录改变后找不到运行时。未找到 Deno 时也会显式启用同目录或 PATH 中的 Node.js（版本要求以官方 EJS 说明为准）。独立版 yt-dlp 已包含所需的 EJS 脚本。使用 pip 安装 yt-dlp 时，请在其兼容的 Python 环境中安装 `yt-dlp[default]`。
 - 安装后重新打开启动窗口，运行 `.\.tools\yt-dlp.exe --version` 和 `deno --version` 检查。网站规则可能变化，下载失效时可按照官方说明更新项目内工具：`.\.tools\yt-dlp.exe -U`。程序会显示实际使用的下载器路径，并先检查所选视频格式能否下载。
 
 下载的视频保存在 `input/downloads/`，文件名包含站点、视频 ID、网址摘要和格式 ID，避免不同网址或清晰度的文件相互覆盖。PDF 和 PNG 仍保存在 `output/`，使用下载文件的名称；裁剪和去二维码的后缀规则不变。下载文件会保留，重复运行同一网址、选择相同格式时通常会复用现有文件，但仍需联网解析网址。旧版下载的文件会保留，首次使用新命名规则时会重新下载。下载目录不随 Git 提交。

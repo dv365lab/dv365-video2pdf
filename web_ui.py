@@ -9,10 +9,12 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 import webbrowser
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -400,10 +402,47 @@ class RequestHandler(BaseHTTPRequestHandler):
             raise ValueError('请求内容必须是 JSON 对象。')
         return value
 
+    def download_all_pdfs(self):
+        jobs = [job for job in self.server.list_jobs()
+                if job['status'] == 'done' and job.get('download_url')]
+        with tempfile.TemporaryFile() as bundle:
+            try:
+                used_names = set()
+                with zipfile.ZipFile(bundle, 'w', compression=zipfile.ZIP_STORED) as archive:
+                    for job in jobs:
+                        pdfs = [path for path in (self.server.work_root / job['id'] / 'output').glob('*')
+                                if path.suffix.lower() == '.pdf' and path.is_file() and path.stat().st_size]
+                        if len(pdfs) != 1:
+                            continue
+                        pdf = pdfs[0]
+                        name, number = pdf.name, 2
+                        while name.casefold() in used_names:
+                            name = f'{pdf.stem} ({number}){pdf.suffix}'
+                            number += 1
+                        used_names.add(name.casefold())
+                        archive.write(pdf, arcname=name)
+                if not used_names:
+                    self.send_json(404, {'error': '暂无已完成且可下载的 PDF。'})
+                    return
+            except OSError:
+                self.send_json(500, {'error': 'PDF 打包失败，请检查结果文件和磁盘空间后重试。'})
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/zip')
+            self.send_header('Content-Length', str(bundle.tell()))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.end_headers()
+            bundle.seek(0)
+            shutil.copyfileobj(bundle, self.wfile, length=1024 * 1024)
+
     def do_GET(self):
         if not self.allowed_request():
             return
         path = urlsplit(self.path).path
+        if path == '/api/jobs/pdf-bundle':
+            self.download_all_pdfs()
+            return
         if path == '/api/session':
             self.send_json(200, {'upload_token': self.server.upload_token})
             return

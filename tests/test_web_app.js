@@ -17,6 +17,7 @@ class Element {
   removeAttribute(name) { delete this[name]; }
   replaceChildren(...children) { this.children = children; }
   remove() { this.removed = true; }
+  click() { this.clicked = true; }
 }
 
 async function run() {
@@ -33,6 +34,28 @@ async function run() {
   const apiRequests = [];
   const jobs = new Map();
   const scheduledPolls = [];
+  const createdElements = [];
+  const bundleBlob = new Blob(["ZIP test data"], { type: "application/zip" });
+  const objectUrls = [];
+  const revokedUrls = [];
+  const downloadCleanup = [];
+  const browserWritable = {};
+  const streamedBundles = [];
+  let bundleRequests = 0;
+  let bundleFailure = null;
+  let bundleFailureStatus = 500;
+  let releaseBundle = null;
+  let bundlePending = false;
+  let bundleEmpty = false;
+  class BrowserURL extends URL {
+    static createObjectURL(blob) {
+      assert.equal(blob, bundleBlob, "download must use the fetched ZIP bytes");
+      const url = `blob:http://localhost/bundle-${objectUrls.length}`;
+      objectUrls.push(url);
+      return url;
+    }
+    static revokeObjectURL(url) { revokedUrls.push(url); }
+  }
   let nextJobState = null;
   let pollFailure = null;
   let failUpload = false;
@@ -57,14 +80,20 @@ async function run() {
   const browserWindow = new Element();
   browserWindow.location = {hash: "#jobs=" + "c".repeat(32) + ",invalid"};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8"), {
-    document: { getElementById: getElement, createElement: () => new Element(), querySelector: () => ({ content: "token" }) },
+    document: { getElementById: getElement, createElement: (tag) => {
+      const element = new Element();
+      element.tagName = tag;
+      createdElements.push(element);
+      return element;
+    }, querySelector: () => ({ content: "token" }) },
     window: browserWindow,
     XMLHttpRequest: Upload,
     URLSearchParams,
-    URL,
+    URL: BrowserURL,
     AbortController,
     setTimeout: (callback, delay) => {
       if (delay === 15000) return {};
+      if (delay === 60000) { downloadCleanup.push(callback); return callback; }
       scheduledPolls.push(callback);
       return callback;
     },
@@ -73,6 +102,18 @@ async function run() {
       if (index !== -1) scheduledPolls.splice(index, 1);
     },
     fetch: async (url, options) => {
+      if (url === "/api/jobs/pdf-bundle") {
+        bundleRequests += 1;
+        if (bundlePending) await new Promise((resolve) => { releaseBundle = resolve; });
+        if (bundleFailure instanceof Error) throw bundleFailure;
+        return bundleFailure
+          ? { ok: false, status: bundleFailureStatus, json: async () => ({ error: bundleFailure }) }
+          : { ok: true, blob: async () => bundleEmpty ? new Blob([]) : bundleBlob,
+              body: { pipeTo: async (destination) => {
+                assert.equal(destination, browserWritable);
+                streamedBundles.push(bundleBlob);
+              } } };
+      }
       if (options?.method === "POST") {
         const body = JSON.parse(options.body);
         apiRequests.push({ url, body, headers: options.headers });
@@ -117,6 +158,10 @@ async function run() {
     },
   });
   await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(getElement("download-all").disabled, true, "no PDF is ready initially");
+  const initialElements = createdElements.length;
+  getElement("download-all").handlers.click();
+  assert.equal(createdElements.length, initialElements, "disabled download must not start a request");
   const drop = getElement("drop-zone").handlers.drop;
   drop({ preventDefault() {}, dataTransfer: {files: [{name: "invalid.txt", size: 10}]} });
   assert.equal(getElement("drop-title").textContent, "文件未添加成功");
@@ -165,6 +210,71 @@ async function run() {
   assert.equal(lastCard.children[1].children[0].children[1].textContent, "100%");
   assert.match(getElement("drop-feedback-help").textContent, /已提交/);
   assert.equal(scheduledPolls.length, 0, 'completed jobs must stop polling');
+  assert.equal(getElement("download-all").disabled, false);
+  assert.equal(getElement("download-all").textContent, "打包下载全部 PDF（2）");
+  bundlePending = true;
+  const pendingBundle = getElement("download-all").handlers.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(getElement("download-all").disabled, true, "disable while preparing browser download");
+  assert.match(getElement("download-all").textContent, /正在/);
+  await getElement("download-all").handlers.click();
+  assert.equal(bundleRequests, 1, "repeated clicks must not fetch another ZIP");
+  releaseBundle();
+  bundlePending = false;
+  await pendingBundle;
+  const bundleLink = createdElements.at(-1);
+  assert.equal(bundleLink.tagName, "a");
+  assert.equal(bundleLink.href, objectUrls[0], "save a local blob URL instead of an HTTP download link");
+  assert.match(bundleLink.href, /^blob:/);
+  assert.equal(bundleLink.download, "video2pdf-pdfs.zip");
+  assert.equal(bundleLink.clicked, true);
+  assert.equal(getElement("download-all").disabled, false);
+  assert.equal(downloadCleanup.length, 1);
+  downloadCleanup.shift()();
+  assert.deepEqual(revokedUrls, objectUrls, "release temporary download URLs");
+
+  const anchorsBeforeFailure = createdElements.filter((element) => element.tagName === "a").length;
+  bundleFailure = "PDF 打包失败，请检查磁盘空间。";
+  await getElement("download-all").handlers.click();
+  assert.match(getElement("notice").textContent, /PDF 打包失败/);
+  assert.equal(getElement("download-all").disabled, false);
+  bundleFailureStatus = 404;
+  bundleFailure = "文件或任务不存在。";
+  await getElement("download-all").handlers.click();
+  assert.match(getElement("notice").textContent, /后台.*新版打包接口.*重新启动/);
+  bundleFailure = "暂无已完成且可下载的 PDF。";
+  await getElement("download-all").handlers.click();
+  assert.equal(getElement("notice").textContent, bundleFailure, "a real empty result must keep its own error message");
+  bundleFailureStatus = 500;
+  bundleFailure = new Error("offline");
+  await getElement("download-all").handlers.click();
+  assert.match(getElement("notice").textContent, /下载失败/);
+  assert.equal(getElement("download-all").disabled, false);
+  assert.equal(createdElements.filter((element) => element.tagName === "a").length, anchorsBeforeFailure, "failed requests must never download an error as a ZIP");
+  bundleFailure = null;
+  bundleEmpty = true;
+  await getElement("download-all").handlers.click();
+  assert.match(getElement("notice").textContent, /未获取到 ZIP/);
+  assert.equal(createdElements.filter((element) => element.tagName === "a").length, anchorsBeforeFailure, "an intercepted empty response must never be saved as an empty ZIP");
+  bundleEmpty = false;
+
+  // Chrome/Edge can stream a large batch straight to the chosen file.
+  const blobsBeforeStreaming = objectUrls.length;
+  browserWindow.showSaveFilePicker = async (options) => {
+    assert.equal(options.suggestedName, "video2pdf-pdfs.zip");
+    return { createWritable: async () => browserWritable };
+  };
+  await getElement("download-all").handlers.click();
+  assert.equal(streamedBundles.length, 1, "large batches must stream to the browser's file writer");
+  assert.equal(objectUrls.length, blobsBeforeStreaming, "streaming must not buffer the entire ZIP in a Blob");
+  assert.match(getElement("notice").textContent, /已.*保存/);
+  const requestsBeforeCancel = bundleRequests;
+  browserWindow.showSaveFilePicker = async () => { const error = new Error("cancelled"); error.name = "AbortError"; throw error; };
+  await getElement("download-all").handlers.click();
+  assert.equal(bundleRequests, requestsBeforeCancel, "cancelling the browser save dialog must not request a ZIP");
+  assert.match(getElement("notice").textContent, /已取消/);
+  assert.equal(getElement("download-all").disabled, false);
+  delete browserWindow.showSaveFilePicker;
 
   await getElement("open-output").handlers.click();
   assert.equal(apiRequests.at(-1).url, "/api/output/open");
@@ -212,6 +322,7 @@ async function run() {
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(apiRequests.at(-1).url, "/api/downloader");
   assert.equal(getElement("jobs").children.at(-1).className, "job done");
+  assert.equal(getElement("download-all").textContent, "打包下载全部 PDF（3）", "review, PNG-only and downloader jobs do not count as PDFs");
 
   nextJobState = { status: 'running', progress: {stage: 'extract', percent: 42} };
   getElement('video-urls').value = 'https://example.com/progress.mp4';
@@ -332,11 +443,13 @@ async function run() {
   restoredJobs = [{...restored, id: "parent", status:"error", retry_job_id:"restored"}, restored];
   const cardsBeforeRestore = getElement("jobs").children.length;
   const postsBeforeRestore = apiRequests.length;
+  const pdfsBeforeRestore = Number(getElement("download-all").textContent.match(/（(\d+)）/)[1]);
   await getElement("restore-jobs").handlers.click();
   await getElement("restore-jobs").handlers.click();
   assert.equal(getElement("jobs").children.length, cardsBeforeRestore + 1);
   assert.equal(apiRequests.length, postsBeforeRestore);
   assert.equal(getElement("jobs").children.at(-1).className, "job done");
+  assert.equal(getElement("download-all").textContent, `打包下载全部 PDF（${pdfsBeforeRestore + 1}）`, "restored PDFs count once");
   legacyListing = true;
   jobs.set("/api/jobs/" + "c".repeat(32), {...restored, id:"c".repeat(32), filename:"旧批次.mp4"});
   await getElement("restore-jobs").handlers.click();

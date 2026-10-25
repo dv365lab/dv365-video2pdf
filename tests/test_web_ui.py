@@ -1,4 +1,5 @@
 import http.client
+import io
 import json
 import os
 import shutil
@@ -8,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -319,6 +321,62 @@ class WebUITests(unittest.TestCase):
             result = self.wait_for_job(job["id"])
             self.assertEqual(result["status"], "done", result)
             self.assertEqual(self.request("GET", result["download_url"])[0], 200)
+        status, headers, body = self.request("GET", "/api/jobs/pdf-bundle")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "application/zip")
+        self.assertNotIn("Content-Disposition", headers, "the fetch response must not trigger an external download manager")
+        self.assertEqual(int(headers["Content-Length"]), len(body))
+        with zipfile.ZipFile(io.BytesIO(body)) as archive:
+            self.assertEqual(archive.namelist(), ["same.pdf", "same (2).pdf"])
+            self.assertIsNone(archive.testzip())
+            for job, name in zip(jobs, archive.namelist()):
+                pdf = next((self.server.work_root / job["id"] / "output").glob("*.pdf"))
+                self.assertEqual(archive.read(name), pdf.read_bytes())
+
+    def test_pdf_bundle_excludes_unfinished_and_missing_results(self):
+        for state in ("queued", "running", "error", "review", "screenshots", "interrupted", "done"):
+            job_id = self.server.add_job(state + ".avi")
+            self.server.update(job_id, status=state, download_url=f"/api/jobs/{job_id}/pdf")
+            folder = self.server.work_root / job_id / "output"
+            folder.mkdir()
+            (folder / "not-ready.pdf").write_bytes(b"unfinished" if state != "done" else b"")
+        downloader = self.server.add_job("downloader", "downloader")
+        self.server.update(downloader, status="done")
+        missing = self.server.add_job("missing.avi")
+        self.server.update(missing, status="done", download_url=f"/api/jobs/{missing}/pdf")
+        status, _, body = self.request("GET", "/api/jobs/pdf-bundle")
+        self.assertEqual(status, 404)
+        self.assertIn("PDF", json.loads(body)["error"])
+
+        completed = self.server.add_job("完成.avi")
+        folder = self.server.work_root / completed / "output"
+        folder.mkdir()
+        (folder / "完成.pdf").write_bytes(b"completed PDF")
+        self.server.update(completed, status="done", download_url=f"/api/jobs/{completed}/pdf")
+        status, _, body = self.request("GET", "/api/jobs/pdf-bundle")
+        self.assertEqual(status, 200)
+        with zipfile.ZipFile(io.BytesIO(body)) as archive:
+            self.assertEqual(archive.namelist(), ["完成.pdf"])
+            self.assertEqual(archive.read("完成.pdf"), b"completed PDF")
+
+    def test_pdf_bundle_preserves_unicode_and_avoids_all_name_collisions(self):
+        for index, name in enumerate(("课程 [1].pdf", "课程 [1] (2).pdf", "课程 [1].pdf", "课程 [1].PDF")):
+            job_id = self.server.add_job(name)
+            folder = self.server.work_root / job_id / "output"
+            folder.mkdir()
+            (folder / name).write_bytes(str(index).encode())
+            self.server.update(job_id, status="done", download_url=f"/api/jobs/{job_id}/pdf")
+        status, _, body = self.request("GET", "/api/jobs/pdf-bundle")
+        self.assertEqual(status, 200)
+        with zipfile.ZipFile(io.BytesIO(body)) as archive:
+            self.assertEqual(len(archive.namelist()), 4)
+            self.assertEqual(len({name.casefold() for name in archive.namelist()}), 4)
+            self.assertEqual(archive.namelist()[:3], ["课程 [1].pdf", "课程 [1] (2).pdf", "课程 [1] (3).pdf"])
+            self.assertEqual([archive.read(name) for name in archive.namelist()], [b"0", b"1", b"2", b"3"])
+
+    def test_pdf_bundle_rejects_cross_origin_requests(self):
+        status, _, _ = self.request("GET", "/api/jobs/pdf-bundle", headers={"Origin": "https://example.com"})
+        self.assertEqual(status, 403)
 
     def test_invalid_video_reports_error_without_download(self):
         status, job = self.upload("broken.mp4", b"not a video")

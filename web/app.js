@@ -7,6 +7,7 @@ let uploading = false;
 let rejectedFiles = [];
 let uploadToken = document.querySelector('meta[name="upload-token"]').content;
 let retryingAll = false;
+let downloadingAll = false;
 let activeRequests = 0;
 const requestWaiters = [];
 // A recovery link can reconnect a pre-upgrade batch without stopping its server.
@@ -57,6 +58,9 @@ function updateCount() {
   const failed = entries.filter(canRetry).length;
   $("retry-failed").disabled = !failed || retryingAll;
   $("retry-failed").textContent = retryingAll ? "正在重试…" : `一键重试失败任务${failed ? `（${failed}）` : ""}`;
+  const completed = entries.filter((entry) => entry.state === "done" && entry.downloadUrl).length;
+  $("download-all").disabled = !completed || downloadingAll;
+  $("download-all").textContent = downloadingAll ? "正在准备浏览器下载…" : `打包下载全部 PDF${completed ? `（${completed}）` : ""}`;
   updateDropFeedback();
 }
 
@@ -249,6 +253,7 @@ function schedulePoll(entry, delay) {
 
 function renderJob(entry, job) {
     entry.state = job.status;
+    entry.downloadUrl = job.download_url;
     entry.retryAvailable = job.retry_available !== false;
     entry.log.textContent = [job.recovery_note, job.log].filter(Boolean).join("\n");
     entry.details.hidden = !entry.log.textContent;
@@ -391,6 +396,52 @@ async function restoreJobs() {
   } finally { $("restore-jobs").disabled = false; }
 }
 $("restore-jobs").addEventListener("click", restoreJobs);
+$("download-all").addEventListener("click", async () => {
+  if ($("download-all").disabled) return;
+  downloadingAll = true;
+  updateCount();
+  $("notice").textContent = "正在获取 ZIP，完成后由浏览器保存，请稍候…";
+  try {
+    const file = window.showSaveFilePicker ? await window.showSaveFilePicker({
+      suggestedName: "video2pdf-pdfs.zip",
+      types: [{ description: "ZIP 压缩包", accept: { "application/zip": [".zip"] } }],
+    }) : null;
+    // Fetch the bytes first so HTTP download links are not handed to external downloaders.
+    const response = await fetch("/api/jobs/pdf-bundle");
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      if (response.status === 404 && (!result.error || result.error === "文件或任务不存在。")) {
+        throw new ApiError("当前后台尚未加载新版打包接口，请重新启动 start_web.bat 后刷新页面；已完成的 PDF 会自动恢复。", response.status);
+      }
+      throw new ApiError(result.error || "打包下载失败，请稍后重试。", response.status);
+    }
+    if (file) {
+      if (!response.body) throw new ApiError("未获取到 ZIP 文件，请刷新页面后重试。", response.status);
+      await response.body.pipeTo(await file.createWritable());
+      $("notice").textContent = "ZIP 已通过浏览器保存到所选位置。";
+    } else {
+      const blob = await response.blob();
+      if (!blob.size) throw new ApiError("未获取到 ZIP 文件，请刷新页面后重试。", response.status);
+      const url = URL.createObjectURL(blob);
+      try {
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "video2pdf-pdfs.zip";
+        link.click();
+      } finally {
+        // Allow the browser to start saving before releasing its local download URL.
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+      }
+      $("notice").textContent = "已交给浏览器下载，请在浏览器下载列表中查看。";
+    }
+  } catch (error) {
+    $("notice").textContent = error.name === "AbortError" ? "已取消保存 ZIP。"
+      : error instanceof ApiError ? error.message : "下载失败，请确认本机服务仍在运行，并检查所选位置的写入权限和磁盘空间后重试。";
+  } finally {
+    downloadingAll = false;
+    updateCount();
+  }
+});
 
 $("choose").addEventListener("click", () => $("file-input").click());
 $("open-output").addEventListener("click", () => openFolder("/api/output/open"));
