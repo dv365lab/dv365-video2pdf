@@ -136,3 +136,6 @@ dmypy.json
 /.uv-cache/
 /.uv-python/
 /.tools/
+
+# Local assistant workspace data
+/.workbuddy-ai/
