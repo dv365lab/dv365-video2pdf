@@ -29,8 +29,8 @@ class SetupDownloaderTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), content)
             self.assertEqual(list(folder.iterdir()), [destination])
             self.assertEqual([call.args[0] for call in urlopen.call_args_list], [
-                "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/SHA2-256SUMS",
-                "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.exe",
+                "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS",
+                "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
             ])
 
     def test_hash_mismatch_preserves_existing_tool_and_removes_temporary_file(self):
@@ -70,9 +70,8 @@ class SetupDownloaderTests(unittest.TestCase):
             folder = Path(temp)
             destination = folder / "yt-dlp.exe"
             destination.write_bytes(b"existing downloader")
-            with patch.object(setup_downloader.urllib.request, "urlopen", return_value=io.BytesIO(
-                f"{'0' * 64}  yt-dlp_macos\n".encode("ascii")
-            )) as urlopen:
+            response = io.BytesIO(f"{'0' * 64}  yt-dlp_macos\n".encode("ascii"))
+            with patch.object(setup_downloader.urllib.request, "urlopen", return_value=response) as urlopen:
                 with self.assertRaisesRegex(ValueError, "SHA-256"):
                     setup_downloader.install_downloader(folder)
                 urlopen.assert_called_once()

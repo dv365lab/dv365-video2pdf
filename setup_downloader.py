@@ -8,8 +8,9 @@ import tempfile
 import urllib.request
 
 
-VERSION = "2026.08.19"
-RELEASE_URL = f"https://github.com/yt-dlp/yt-dlp/releases/download/{VERSION}"
+VERSION = "latest"
+# Follow the official stable release so the UI's update button really updates.
+RELEASE_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download"
 
 
 def install_downloader(tools_dir=None):

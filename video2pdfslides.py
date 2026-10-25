@@ -96,6 +96,17 @@ def upgrade_vidyard_master(url):
     return parts._replace(path=f'{directory}/master.m3u8').geturl()
 
 
+def downloader_runtime_options(downloader):
+    '''Resolve JS runtimes independently of a Web task's working directory.'''
+    folder = Path(downloader).resolve().parent
+    for name in ('deno', 'node'):
+        local = folder / (name + '.exe' if os.name == 'nt' else name)
+        runtime = str(local) if local.is_file() else shutil.which(name)
+        if runtime:
+            return ['--js-runtimes', f'{name}:{runtime}']
+    return []
+
+
 def download_video(url, download_dir='input/downloads', referer=None, cookies_from_browser=None, add_headers=None):
     '''Use the external yt-dlp command without changing the project Python environment.'''
     downloader = get_downloader()
@@ -119,7 +130,7 @@ def download_video(url, download_dir='input/downloads', referer=None, cookies_fr
     print('正在下载视频，保存目录:', folder, flush=True)
     with tempfile.TemporaryDirectory(prefix='.download-', dir=folder) as temp:
         result_file = Path(temp) / 'video-path.jsonl'
-        options = []
+        options = downloader_runtime_options(downloader)
         if referer:
             options += ['--referer', referer]
         if cookies_from_browser:
@@ -129,11 +140,12 @@ def download_video(url, download_dir='input/downloads', referer=None, cookies_fr
         command = [
             downloader, '--ignore-config', '--no-cache-dir', '--no-playlist', '--playlist-items', '1',
             '--match-filters', '!is_live & !playlist & live_status!=?is_upcoming',
-            '--format', 'bv*[vcodec^=avc1]/bv*[vcodec^=h264]/bv*',
+            '--format', 'bv*',
+            '--format-sort-force', '--format-sort', 'res,fps',
             '--check-formats',
             '--restrict-filenames', '--windows-filenames', '--no-overwrites',
             '--paths', str(folder),
-            '--output', '%(extractor_key)s-%(id)s-' + url_id + '.%(ext)s',
+            '--output', '%(extractor_key)s-%(id)s-' + url_id + '-%(format_id)s.%(ext)s',
             '--print-to-file', 'after_move:%(filepath)j', str(result_file).replace('%', '%%'),
             '--no-simulate', '--newline', '--encoding', 'utf-8',
             '--socket-timeout', '30', '--retries', '3', '--fragment-retries', '3',
