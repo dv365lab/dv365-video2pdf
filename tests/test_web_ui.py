@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,35 @@ import numpy as np
 import pikepdf
 
 import web_ui
+
+
+class WebServerPortTests(unittest.TestCase):
+    def test_uses_preferred_port_when_available(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+
+        with tempfile.TemporaryDirectory() as temp:
+            server = web_ui.create_server(port, Path(temp) / "jobs")
+            try:
+                self.assertEqual(server.server_port, port)
+            finally:
+                server.server_close()
+
+    def test_switches_to_available_port_when_preferred_port_is_occupied(self):
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen()
+            port = occupied.getsockname()[1]
+
+            with tempfile.TemporaryDirectory() as temp:
+                server = web_ui.create_server(port, Path(temp) / "jobs")
+                try:
+                    self.assertNotEqual(server.server_port, port)
+                    with socket.create_connection(("127.0.0.1", server.server_port), timeout=5):
+                        pass
+                finally:
+                    server.server_close()
 
 
 class WebUITests(unittest.TestCase):

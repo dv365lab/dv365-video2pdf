@@ -1,6 +1,7 @@
 """Local browser UI, using the existing CLI in isolated job directories."""
 
 import argparse
+import errno
 import json
 import math
 import os
@@ -662,20 +663,33 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 
 def create_server(port=8786, work_root=None):
-    return WebServer(port, work_root if work_root is not None else PROJECT_ROOT / "output" / "web")
+    root = work_root if work_root is not None else PROJECT_ROOT / "output" / "web"
+    try:
+        return WebServer(port, root)
+    except OSError as error:
+        # Bind an OS-selected port directly instead of checking first, which
+        # would leave a race between the availability check and server startup.
+        address_in_use = (error.errno in (errno.EADDRINUSE, errno.EACCES)
+                          or getattr(error, 'winerror', None) in (10013, 10048))
+        if port == 0 or not address_in_use:
+            raise
+        return WebServer(0, root)
 
 
 def main():
     parser = argparse.ArgumentParser(description="video2pdf 本地 Web UI")
-    parser.add_argument("--port", type=int, default=8786, help="本地端口（默认 8786）")
+    parser.add_argument("--port", type=int, default=8786,
+                        help="首选本地端口（默认 8786，被占用时自动选择空闲端口）")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     args = parser.parse_args()
     try:
         server = create_server(args.port)
     except OSError as error:
-        print(f"无法启动 Web UI：{error}。可使用 --port 更换端口。", file=sys.stderr)
+        print(f"无法启动 Web UI：{error}。", file=sys.stderr)
         return 1
     url = f"http://127.0.0.1:{server.server_port}"
+    if args.port != 0 and server.server_port != args.port:
+        print(f"端口 {args.port} 已被占用，已自动切换到 {server.server_port}。", flush=True)
     print(f"Web UI：{url}\n结果目录：{server.work_root}\n按 Ctrl+C 停止服务（等待当前转换结束）。", flush=True)
     if not args.no_browser:
         webbrowser.open(url)
