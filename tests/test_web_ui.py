@@ -25,6 +25,27 @@ import web_ui
 
 
 class WebServerPortTests(unittest.TestCase):
+    def test_main_opens_and_reports_actual_port(self):
+        with socket.socket() as occupied, tempfile.TemporaryDirectory() as temp:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen()
+            port = occupied.getsockname()[1]
+            server = web_ui.create_server(port, Path(temp) / "jobs")
+            self.assertNotEqual(server.server_port, port)
+            url = f"http://127.0.0.1:{server.server_port}"
+            try:
+                with patch.object(sys, 'argv', ['web_ui.py', '--port', str(port)]), \
+                     patch.object(web_ui, 'create_server', return_value=server), \
+                     patch.object(web_ui.webbrowser, 'open') as browser, \
+                     patch.object(server, 'serve_forever'), \
+                     patch('sys.stdout', new_callable=io.StringIO) as output:
+                    self.assertEqual(web_ui.main(), 0)
+                browser.assert_called_once_with(url)
+                self.assertIn(url, output.getvalue())
+                self.assertIn(str(port), output.getvalue())
+            finally:
+                server.server_close()
+
     def test_uses_preferred_port_when_available(self):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
