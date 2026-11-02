@@ -185,8 +185,8 @@ function showJobProgress(entry, job) {
 function upload(entry, options) {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
-    const { crop_top, crop_bottom, remove_qr, mode, sample_interval } = options;
-    request.open("POST", "/api/jobs?" + new URLSearchParams({ filename: entry.file.name, crop_top, crop_bottom, remove_qr, mode, sample_interval }));
+    const { crop_top, crop_bottom, remove_qr, enhance_pdf, mode, sample_interval } = options;
+    request.open("POST", "/api/jobs?" + new URLSearchParams({ filename: entry.file.name, crop_top, crop_bottom, remove_qr, enhance_pdf, mode, sample_interval }));
     request.setRequestHeader("Content-Type", "application/octet-stream");
     request.setRequestHeader("X-Upload-Token", uploadToken);
     request.upload.addEventListener("progress", (event) => {
@@ -587,7 +587,7 @@ $("drop-zone").addEventListener("drop", (event) => {
 
 $("convert-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const options = { crop_top: $("crop-top").value, crop_bottom: $("crop-bottom").value, remove_qr: String($("remove-qr").checked), sample_interval: $("sample-interval").value, mode: $("output-mode").value };
+  const options = { crop_top: $("crop-top").value, crop_bottom: $("crop-bottom").value, remove_qr: String($("remove-qr").checked), enhance_pdf: String($("enhance-pdf").checked), sample_interval: $("sample-interval").value, mode: $("output-mode").value };
   const downloadOptions = { referer: $("referer").value.trim(), cookies_from_browser: $("cookies-from-browser").value.trim(), add_headers: $("add-headers").value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) };
   const pending = entries.filter((entry) => entry.state === "pending");
   if (uploading || !pending.length) return;

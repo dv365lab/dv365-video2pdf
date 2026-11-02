@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 import numpy as np
 import zxingcpp
-from PIL import Image
+from PIL import Image, ImageFilter
 
 ############# Define constants
 
@@ -368,8 +368,71 @@ def remove_branding_text(frame):
     return cleaned
 
 
+def remove_capture_branding(frame):
+    '''Clean the known corner block and isolated logos farther inside the bottom-right area.'''
+    frame = remove_corner_branding(frame)
+    height, width = frame.shape[:2]
+    left, top = width // 2, round(height * 0.6)
+    hsv = cv2.cvtColor(frame[top:, left:], cv2.COLOR_BGR2HSV)
+    cyan = cv2.inRange(hsv, np.array([80, 90, 75]), np.array([105, 255, 255]))
+    if np.count_nonzero(cyan) < 40:
+        return frame
+    template = get_branding_logo_template()
+    contours, _ = cv2.findContours(cyan, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cleaned = frame
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if min(w, h) < 10 or w > width * 0.15 or not 0.8 < w / h < 1.3:
+            continue
+        scaled = cv2.resize(template, (w, h), interpolation=cv2.INTER_AREA)
+        score = float(cv2.matchTemplate(cyan[y:y + h, x:x + w], scaled, cv2.TM_CCOEFF_NORMED)[0, 0])
+        if score < 0.85:
+            continue
+        x, y = x + left, y + top
+        margin = max(3, round(h * 0.08))
+        x1, y1 = max(0, x - margin), max(0, y - margin)
+        x2, y2 = min(width, x + w + margin), min(height, y + h + margin)
+        background = np.concatenate([
+            frame[max(0, y1 - margin):y1, x1:x2].reshape(-1, 3),
+            frame[y2:min(height, y2 + margin), x1:x2].reshape(-1, 3),
+            frame[y1:y2, max(0, x1 - margin):x1].reshape(-1, 3),
+            frame[y1:y2, x2:min(width, x2 + margin)].reshape(-1, 3),
+        ])
+        if not len(background):
+            continue
+        if cleaned is frame:
+            cleaned = frame.copy()
+        # An isolated logo must not clear the text or diagrams to its right/below.
+        cleaned[y1:y2, x1:x2] = np.median(background, axis=0).astype(frame.dtype)
+    return cleaned
+
+
+def is_progressive_reveal(first, second):
+    '''Recognize added content on a shared slide background without losing earlier content.'''
+    if first.shape != second.shape:
+        return False
+    backgrounds = []
+    for feature in (first, second):
+        # Use the margins so a newly revealed large graphic cannot become the background.
+        border = np.concatenate((feature[0], feature[-1], feature[:, 0], feature[:, -1]))
+        backgrounds.append(int(np.bincount(border, minlength=256).argmax()))
+    background, next_background = backgrounds
+    if abs(background - next_background) > PIXEL_CHANGE_THRESHOLD:
+        return False
+
+    before = np.abs(first.astype(np.int16) - background)
+    after = np.abs(second.astype(np.int16) - background)
+    changed = cv2.absdiff(first, second) > PIXEL_CHANGE_THRESHOLD
+    added = np.count_nonzero(changed & (after > before + PIXEL_CHANGE_THRESHOLD))
+    removed = np.count_nonzero(changed & (before > after + PIXEL_CHANGE_THRESHOLD))
+    content = np.count_nonzero(before > PIXEL_CHANGE_THRESHOLD)
+    # Both limits matter: a shared title must not hide a small body-text replacement,
+    # and a large new illustration must not hide the loss of the previous title.
+    return added > 0 and removed <= added * 0.02 and removed <= content * 0.005
+
+
 def detect_unique_screenshots(video_path, output_folder_screenshot_path, crop_top=0, crop_bottom=0, remove_qr=False):
-    '''Select stable content changes, retaining short pages and final animation states.'''
+    '''Select stable pages, keeping only the final frame of each progressive reveal.'''
     start_time = time.time()
     screenshots_count = 0
     previous = None
@@ -401,13 +464,17 @@ def detect_unique_screenshots(video_path, output_folder_screenshot_path, crop_to
     def select(candidate, reference=None):
         nonlocal pending, anchor
         if anchor is None or percent(changed_pixels(anchor, candidate[1])) >= PAGE_CHANGE_PERCENT:
-            flush()
+            if pending is not None:
+                same_frame = percent(changed_pixels(pending[1], candidate[1])) < PAGE_CHANGE_PERCENT
+                if not same_frame and not is_progressive_reveal(pending[1], candidate[1]):
+                    flush()
             pending = candidate
             anchor = candidate[1] if reference is None else reference
 
     for _, frame_time, frame in get_frames(video_path):
         if remove_qr:
             frame = remove_qr_codes(frame)
+        frame = remove_capture_branding(frame)
         frame = crop_frame(frame, crop_top, crop_bottom)
         small = imutils.resize(frame, width=600)
         feature = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (3, 3), 0)
@@ -415,8 +482,11 @@ def detect_unique_screenshots(video_path, output_folder_screenshot_path, crop_to
         if previous is not None:
             motion = percent(changed_pixels(previous[1], feature))
             # A brief completed page may have only one sample before a transition.
-            if motion >= SCENE_CHANGE_PERCENT and previous_motion < SCENE_CHANGE_PERCENT:
-                select(previous)
+            if motion >= SCENE_CHANGE_PERCENT:
+                if previous_motion < SCENE_CHANGE_PERCENT or (
+                    pending is not None and is_progressive_reveal(pending[1], previous[1])
+                ):
+                    select(previous)
             if anchor is not None:
                 persistent_change = percent(
                     changed_pixels(anchor, previous[1]) & changed_pixels(anchor, feature)
@@ -465,11 +535,18 @@ def initialize_output_folder(video_path, crop_top=0, crop_bottom=0, remove_qr=Fa
     return output_folder_screenshot_path
 
 
-def convert_screenshots_to_pdf(output_folder_screenshot_path):
+def enhance_pdf_image(image):
+    '''Improve soft text edges at native resolution without altering the review PNG.'''
+    return image.filter(ImageFilter.UnsharpMask(radius=0.7, percent=100, threshold=3))
+
+
+def convert_screenshots_to_pdf(output_folder_screenshot_path, enhance_pdf=False):
     output_pdf_path = str(output_folder_screenshot_path) + '.pdf'
     print('output_folder_screenshot_path', output_folder_screenshot_path)
     print('output_pdf_path', output_pdf_path)
     print('converting images to pdf..')
+    if enhance_pdf:
+        print('PDF 清晰度增强已开启：轻度锐化，保留原始像素尺寸。', flush=True)
     screenshots = sorted(Path(output_folder_screenshot_path).glob('*.png'))
     # Keep the review PNGs intact. Only cleaned copies are embedded in the PDF,
     # so rebuilding a PDF from existing screenshots also removes branding.
@@ -481,10 +558,13 @@ def convert_screenshots_to_pdf(output_folder_screenshot_path):
             with Image.open(path) as source:
                 frame = np.ascontiguousarray(np.asarray(source.convert('RGB'))[:, :, ::-1])
                 cleaned = remove_branding_text(frame)
-                if cleaned is not frame:
+                if cleaned is not frame or enhance_pdf:
                     cleaned_path = Path(temp) / f'{index:06}.png'
                     options = {'dpi': source.info['dpi']} if 'dpi' in source.info else {}
-                    Image.fromarray(cleaned[:, :, ::-1]).save(cleaned_path, **options)
+                    pdf_image = Image.fromarray(cleaned[:, :, ::-1])
+                    if enhance_pdf:
+                        pdf_image = enhance_pdf_image(pdf_image)
+                    pdf_image.save(cleaned_path, **options)
                     pdf_images.append(str(cleaned_path))
                 else:
                     pdf_images.append(str(path))
@@ -508,6 +588,7 @@ if __name__ == "__main__":
     parser.add_argument("video_path", help="local video path or HTTP(S) video URL to convert to PDF slides", type=str)
     parser.add_argument("--review", action="store_true", help="pause to review screenshots before creating the PDF")
     parser.add_argument('--extract-only', action='store_true', help='save PNG screenshots without creating a PDF')
+    parser.add_argument('--enhance-pdf', action='store_true', help='gently sharpen PDF text edges at native resolution; keep PNGs unchanged')
     parser.add_argument('--sample-interval', type=float, default=1 / FRAME_RATE, metavar='SECONDS', help='seconds between sampled frames (default: 1)')
     parser.add_argument("--crop-top", type=int, default=0, metavar="PIXELS", help="crop this many pixels from the top before detection and saving")
     parser.add_argument("--crop-bottom", type=int, default=0, metavar="PIXELS", help="crop this many pixels from the bottom before detection and saving")
@@ -562,4 +643,4 @@ if __name__ == "__main__":
                 print('please enter a valid choice')
 
     if choice == 'y' and not args.extract_only:
-        convert_screenshots_to_pdf(output_folder_screenshot_path)
+        convert_screenshots_to_pdf(output_folder_screenshot_path, enhance_pdf=args.enhance_pdf)

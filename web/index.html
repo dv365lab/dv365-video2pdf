@@ -76,10 +76,11 @@
           <label>底部裁剪 <span>像素</span><input id="crop-bottom" type="number" min="0" step="1" value="0" required></label>
           <label>采样间隔 <span>秒</span><input id="sample-interval" type="number" min="0.01" step="any" value="1" required></label>
         </div>
-        <p class="hint">间隔越小越容易保留短停留页面，也会增加处理时间；最终仍按内容变化选择截图。</p>
+        <p class="hint">间隔越小越容易保留短停留页面，也会增加处理时间。同页逐步出现的文字、图形自动合并，只保留最后完整画面。</p>
         <label class="checkbox"><input id="remove-qr" type="checkbox"><span>自动移除二维码<small>用附近背景色覆盖，可与上下裁剪一起使用</small></span></label>
-        <div class="branding-note"><div><strong>品牌标记自动清理</strong><span class="enabled">默认开启</span></div><p>半导体教育领航者 · 移知 · www.eeeknow.com · www.eeeknow.com（移知）及格式变体</p><p>右下角移知图形 Logo、字样、小网址和日期时间整块清理</p><small>识别到该 Logo 后，用附近背景色覆盖至右下边缘；其他 Logo 不处理。仅清理 PDF，原 PNG 保留；复杂背景可能留下覆盖痕迹。</small></div>
+        <div class="branding-note"><div><strong>品牌标记自动清理</strong><span class="enabled">默认开启</span></div><p>半导体教育领航者 · 移知 · www.eeeknow.com · www.eeeknow.com（移知）及格式变体</p><p>采集时清除底部偏右的移知图形 Logo，无需紧贴右下角，PNG 同样生效</p><small>独立 Logo 用附近背景色局部覆盖；右下角整组 Logo、字样、小网址和日期时间仍整块清理。其他指定文字仅在 PDF 中清理。复杂背景可能留下覆盖痕迹。</small></div>
         <label class="output-mode" for="output-mode">输出方式</label><select id="output-mode"><option value="auto">自动生成 PDF，同时保留 PNG</option><option value="review">先检查 PNG，再确认生成 PDF</option><option value="png">仅保存 PNG，暂不生成 PDF</option></select>
+        <label class="checkbox"><input id="enhance-pdf" type="checkbox" checked><span>PDF 清晰度增强<small>轻度锐化文字边缘，保留原分辨率；不修改 PNG，不恢复原视频缺失的细节</small></span></label>
         <p class="hint">选择人工检查后，可打开截图目录删除多余页面，再点击任务上的“确认生成 PDF”。</p>
         <div class="action-row"><span id="selection-count">还未添加待处理任务</span><button type="submit" class="primary" id="convert" disabled>开始转换 <span aria-hidden="true">→</span></button></div>
       </form>

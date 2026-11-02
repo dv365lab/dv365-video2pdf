@@ -103,14 +103,14 @@ class RemoveQrTests(unittest.TestCase):
                 "sample.mp4", "unused-output", remove_qr=True
             )
         resize.assert_called_once()
-        grayscale.assert_called_once()
+        gray_calls = [call for call in grayscale.call_args_list if call.args[1] == cv2.COLOR_BGR2GRAY]
+        self.assertEqual(len(gray_calls), 1)
         save.assert_called_once()
         detected_frame = resize.call_args.args[0]
         saved_frame = save.call_args.args[1]
         self.assert_only_qr_regions_changed(original, detected_frame, [box])
         np.testing.assert_array_equal(detected_frame, expected)
-        np.testing.assert_array_equal(grayscale.call_args.args[0], expected_resized)
-        self.assertEqual(grayscale.call_args.args[1], cv2.COLOR_BGR2GRAY)
+        np.testing.assert_array_equal(gray_calls[0].args[0], expected_resized)
         np.testing.assert_array_equal(saved_frame, detected_frame)
         np.testing.assert_array_equal(frame, original)
 

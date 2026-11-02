@@ -298,7 +298,7 @@ class WebUITests(unittest.TestCase):
     def test_download_settings_and_sampling_reach_cli_as_separate_arguments(self):
         options = web_ui.parse_options({'referer': 'https://example.com/page?a=1&b=2',
             'cookies_from_browser': 'edge:Default', 'add_headers': ['User-Agent: Example Test'],
-            'sample_interval': 0.5, 'remove_qr': True})
+            'sample_interval': 0.5, 'remove_qr': True, 'enhance_pdf': True})
         job_id = self.server.add_job('url test', 'url')
         with patch.object(self.server, 'run_command') as run, patch.object(self.server, 'finish_pdf'):
             self.server.convert(job_id, 'https://example.com/lesson?a=1&b=2', options)
@@ -307,6 +307,19 @@ class WebUITests(unittest.TestCase):
                                ('--add-header', 'User-Agent: Example Test'), ('--sample-interval', '0.5')]:
             self.assertEqual(command[command.index(flag) + 1], expected)
         self.assertIn('--remove-qr', command)
+        self.assertIn('--enhance-pdf', command)
+
+    def test_review_compose_preserves_pdf_enhancement_option(self):
+        folder = self.root / 'review-slides'
+        folder.mkdir()
+        options = web_ui.parse_options({'mode': 'review', 'enhance_pdf': True})
+        job_id = self.server.add_job('review-slides', 'screenshots', source=folder, options=options)
+        self.server.update(job_id, screenshots_path=str(folder))
+        with patch.object(self.server, 'run_command') as run, patch.object(self.server, 'finish_pdf'):
+            self.server.compose(job_id)
+        command = run.call_args.args[1]
+        self.assertEqual(command[-2:], [str(folder), 'true'])
+        self.assertIn('enhance_pdf=sys.argv[3]', command[5])
 
     @unittest.skipUnless((web_ui.PROJECT_ROOT / '.tools/yt-dlp.exe').is_file() or shutil.which('yt-dlp'), 'yt-dlp unavailable')
     def test_http_video_url_converts_through_web_queue(self):
@@ -445,6 +458,7 @@ class WebUITests(unittest.TestCase):
             ("lesson.mp4", b"data", {"crop_top": -1}),
             ("lesson.mp4", b"data", {"crop_bottom": "1.5"}),
             ("lesson.mp4", b"data", {"remove_qr": "maybe"}),
+            ("lesson.mp4", b"data", {"enhance_pdf": "maybe"}),
             ("lesson.mp4", b"data", {"mode": "invalid"}),
             ("lesson.mp4", b"data", {"sample_interval": "0"}),
             ("lesson.mp4", b"data", {"sample_interval": "nan"}),

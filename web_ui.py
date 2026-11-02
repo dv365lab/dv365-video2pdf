@@ -26,7 +26,7 @@ from local_sources import VIDEO_EXTENSIONS, resolve_local_sources
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = PROJECT_ROOT / "web"
-CONVERSION_OPTION_KEYS = ('crop_top', 'crop_bottom', 'sample_interval', 'remove_qr', 'mode')
+CONVERSION_OPTION_KEYS = ('crop_top', 'crop_bottom', 'sample_interval', 'remove_qr', 'enhance_pdf', 'mode')
 
 
 def open_folder(path):
@@ -79,6 +79,9 @@ def parse_options(values):
     if not math.isfinite(interval) or interval <= 0:
         raise ValueError('采样间隔必须是大于 0 的有限秒数。')
     qr = str(values.get('remove_qr', False)).lower()
+    enhance = str(values.get('enhance_pdf', False)).lower()
+    if enhance not in ('true', 'false'):
+        raise ValueError('PDF 清晰度增强选项无效。')
     mode = values.get('mode', 'auto')
     if qr not in ('true', 'false') or mode not in ('auto', 'review', 'png'):
         raise ValueError('二维码或输出方式选项无效。')
@@ -98,7 +101,7 @@ def parse_options(values):
     ):
         raise ValueError('请求头请按每行“名称:值”填写。')
     return dict(crop_top=top, crop_bottom=bottom, sample_interval=interval,
-                remove_qr=qr == 'true', mode=mode, referer=referer,
+                remove_qr=qr == 'true', enhance_pdf=enhance == 'true', mode=mode, referer=referer,
                 cookies_from_browser=cookies, add_headers=headers)
 
 
@@ -324,6 +327,8 @@ class WebServer(ThreadingHTTPServer):
         ]
         if options['remove_qr']:
             command.append("--remove-qr")
+        if options.get('enhance_pdf', False):
+            command.append('--enhance-pdf')
         if options['mode'] != 'auto':
             command.append('--extract-only')
         for key, flag in [('referer', '--referer'), ('cookies_from_browser', '--cookies-from-browser')]:
@@ -346,10 +351,12 @@ class WebServer(ThreadingHTTPServer):
 
     def compose(self, job_id):
         folder = self.snapshot(job_id)['screenshots_path']
+        enhance = self.job_specs.get(job_id, {}).get('options', {}).get('enhance_pdf', False)
         command = [sys.executable, '-X', 'utf8', '-u', '-c',
                    'import sys; sys.path.insert(0, sys.argv[1]); '
-                   'from video2pdfslides import convert_screenshots_to_pdf; convert_screenshots_to_pdf(sys.argv[2])',
-                   str(PROJECT_ROOT), folder]
+                   'from video2pdfslides import convert_screenshots_to_pdf; '
+                   'convert_screenshots_to_pdf(sys.argv[2], enhance_pdf=sys.argv[3] == "true")',
+                   str(PROJECT_ROOT), folder, str(enhance).lower()]
         try:
             self.run_command(job_id, command, self.work_root / job_id)
             self.finish_pdf(job_id)

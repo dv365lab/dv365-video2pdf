@@ -62,6 +62,10 @@ class CliCompletionTests(unittest.TestCase):
         result = self.run_conversion(extra_args=['--extract-only', '--sample-interval', '2'], pdf_expected=False)
         self.assertIn('FRAME_RATE 0.5', result.stdout)
 
+    def test_pdf_enhancement_is_available_from_cli(self):
+        result = self.run_conversion(extra_args=['--enhance-pdf'])
+        self.assertIn('PDF 清晰度增强已开启', result.stdout)
+
     def test_invalid_sampling_and_conflicting_modes_fail_before_reading_video(self):
         for options in [['--sample-interval', value] for value in ['0', '-1', 'nan', 'inf']] + [['--review', '--extract-only']]:
             with self.subTest(options=options):

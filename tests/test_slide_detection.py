@@ -1,3 +1,5 @@
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,6 +7,7 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
+import pikepdf
 
 import video2pdfslides
 
@@ -58,7 +61,94 @@ class SlideDetectionTests(unittest.TestCase):
             cv2.putText(frame, f'item {i}', (30, 130 + 30 * i), cv2.FONT_HERSHEY_SIMPLEX, .4, (0, 0, 0), 1)
             frames.extend([frame.copy()] * 2)
         screenshots = self.extract(frames)
+        self.assertEqual(len(screenshots), 1)
         self.assert_contains(screenshots, frame)
+
+    def test_each_animation_group_keeps_only_its_last_frame(self):
+        frames, complete = [], []
+        for title in ('First topic', 'Second topic'):
+            frame = self.page(title)
+            frames.extend([frame.copy()] * 3)
+            for index in range(3):
+                cv2.rectangle(frame, (40 + 170 * index, 130), (160 + 170 * index, 270), (40, 80, 120), -1)
+                frames.extend([frame.copy()] * 4)
+            complete.append(frame.copy())
+        screenshots = self.extract(frames)
+        self.assertEqual(len(screenshots), 2)
+        for image, expected in zip(screenshots, complete):
+            np.testing.assert_array_equal(image, expected)
+
+    def test_dark_slide_reveals_stay_in_one_group_despite_long_pauses(self):
+        frame = np.full((338, 600, 3), 25, dtype=np.uint8)
+        cv2.putText(frame, 'Dark slide', (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        frames = [frame.copy()] * 40
+        for index in range(3):
+            cv2.putText(frame, f'item {index}', (30, 150 + 45 * index), cv2.FONT_HERSHEY_SIMPLEX,
+                        .7, (150, 210, 255), 2)
+            frames.extend([frame.copy()] * 40)
+        screenshots = self.extract(frames)
+        self.assertEqual(len(screenshots), 1)
+        np.testing.assert_array_equal(screenshots[0], frame)
+
+    def test_large_graphic_and_later_text_are_one_animation_group(self):
+        title = self.page('Large graphic')
+        graphic = title.copy()
+        cv2.rectangle(graphic, (20, 100), (580, 300), (100, 160, 220), -1)
+        complete = graphic.copy()
+        cv2.putText(complete, 'Final caption', (30, 330), cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 0, 0), 2)
+        screenshots = self.extract([title] * 4 + [graphic] * 4 + [complete] * 4)
+        self.assertEqual(len(screenshots), 1)
+        np.testing.assert_array_equal(screenshots[0], complete)
+
+    def test_fading_in_text_finishes_at_full_contrast(self):
+        title = self.page('Fading in')
+        frames = [title.copy()] * 3
+        for brightness in (170, 100, 0):
+            frame = title.copy()
+            cv2.putText(frame, 'Final content', (30, 180), cv2.FONT_HERSHEY_SIMPLEX,
+                        1, (brightness,) * 3, 2)
+            frames.extend([frame] * 3)
+        screenshots = self.extract(frames)
+        self.assertEqual(len(screenshots), 1)
+        np.testing.assert_array_equal(screenshots[0], frame)
+
+    def test_background_change_is_not_an_additive_reveal(self):
+        first = self.page('Same title', 255)
+        second = self.page('Same title', 180)
+        screenshots = self.extract([first] * 4 + [second] * 4)
+        self.assertEqual(len(screenshots), 2)
+        for image, expected in zip(screenshots, (first, second)):
+            np.testing.assert_array_equal(image, expected)
+
+    def test_complete_large_reveal_is_kept_even_if_visible_for_only_one_sample(self):
+        partial = self.page('Brief final reveal')
+        complete = partial.copy()
+        cv2.rectangle(complete, (40, 130), (550, 280), (30, 90, 150), -1)
+        next_page = self.page('Next page', 160)
+        for tail in ([], [next_page] * 4):
+            with self.subTest(at_end=not tail):
+                screenshots = self.extract([partial] * 4 + [complete] + tail)
+                self.assertEqual(len(screenshots), 1 + bool(tail))
+                np.testing.assert_array_equal(screenshots[0], complete)
+                if tail:
+                    np.testing.assert_array_equal(screenshots[1], next_page)
+
+    def test_small_text_replacement_under_shared_title_is_a_separate_page(self):
+        first = self.page('Shared presentation title')
+        cv2.putText(first, 'Version 001', (30, 160), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+        second = self.page('Shared presentation title')
+        cv2.putText(second, 'Version 002', (30, 160), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+        screenshots = self.extract([first] * 5 + [second] * 5)
+        self.assertEqual(len(screenshots), 2)
+        for image, expected in zip(screenshots, (first, second)):
+            np.testing.assert_array_equal(image, expected)
+
+    def test_complete_slide_is_not_replaced_by_a_subsequent_blank_frame(self):
+        partial = self.page('Completed before blank')
+        complete = partial.copy()
+        cv2.putText(complete, 'Final item', (30, 160), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+        screenshots = self.extract([partial] * 4 + [complete] * 4 + [np.full_like(complete, 255)] * 3)
+        np.testing.assert_array_equal(screenshots[0], complete)
 
     def test_moving_pointer_neither_blocks_nor_floods_a_static_page(self):
         frames = []
@@ -79,6 +169,41 @@ class SlideDetectionTests(unittest.TestCase):
         self.assert_contains(screenshots, a)
         self.assert_contains(screenshots, b)
         self.assertLessEqual(len(screenshots), 3)
+
+    def test_cli_png_and_pdf_contain_only_complete_animation_groups(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
+            folder = Path(temp).resolve()
+            video = folder / 'animations.avi'
+            writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*'MJPG'), 2, (600, 338))
+            self.assertTrue(writer.isOpened())
+            complete = []
+            try:
+                for title in ('First topic', 'Second topic'):
+                    frame = self.page(title)
+                    for stage in range(4):
+                        if stage:
+                            cv2.putText(frame, f'Item {stage}', (30, 110 + 50 * stage),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+                        for _ in range(6):
+                            writer.write(frame)
+                    complete.append(frame.copy())
+            finally:
+                writer.release()
+            result = subprocess.run(
+                [sys.executable, str(Path(video2pdfslides.__file__).resolve()), str(video)],
+                cwd=folder, input='', capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            output = folder / 'output' / 'animations'
+            screenshots = sorted(output.glob('*.png'))
+            self.assertEqual(len(screenshots), 2, result.stdout)
+            self.assertEqual([path.name for path in screenshots], ['0000_0.18.png', '0001_0.38.png'])
+            for path, expected in zip(screenshots, complete):
+                image = cv2.imread(str(path))
+                self.assertEqual(image.shape, expected.shape)
+                self.assertLess(np.mean(cv2.absdiff(image, expected)), 1)
+            with pikepdf.open(str(output) + '.pdf') as document:
+                self.assertEqual(len(document.pages), 2)
 
 
 if __name__ == '__main__':

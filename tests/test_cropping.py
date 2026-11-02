@@ -48,11 +48,12 @@ class CropFrameTests(unittest.TestCase):
                 "sample.mp4", "unused-output", crop_top=2, crop_bottom=3
             )
         resize.assert_called_once()
-        grayscale.assert_called_once()
+        gray_calls = [call for call in grayscale.call_args_list
+                      if call.args[1] == video2pdfslides.cv2.COLOR_BGR2GRAY]
+        self.assertEqual(len(gray_calls), 1)
         save.assert_called_once()
         np.testing.assert_array_equal(resize.call_args.args[0], expected)
-        np.testing.assert_array_equal(grayscale.call_args.args[0], expected_resized)
-        self.assertEqual(grayscale.call_args.args[1], video2pdfslides.cv2.COLOR_BGR2GRAY)
+        np.testing.assert_array_equal(gray_calls[0].args[0], expected_resized)
         np.testing.assert_array_equal(save.call_args.args[1], expected)
         np.testing.assert_array_equal(frame, original)
 

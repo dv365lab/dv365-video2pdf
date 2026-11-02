@@ -56,7 +56,7 @@ class WebRecoveryTests(unittest.TestCase):
         return source, job
 
     def test_session_and_jobs_are_restored_after_restart(self):
-        source, job = self.add_local({'crop_top': 7, 'sample_interval': 2})
+        source, job = self.add_local({'crop_top': 7, 'sample_interval': 2, 'enhance_pdf': True})
         self.server.update(job['id'], status='running')
         restarted = self.start_server()
         status, session = self.request('GET', '/api/session', server=restarted)
@@ -72,6 +72,7 @@ class WebRecoveryTests(unittest.TestCase):
         self.assertEqual(status, 202, retried)
         self.assertEqual(submit.call_args.args[2], source)
         self.assertEqual(submit.call_args.args[3]['crop_top'], 7)
+        self.assertTrue(submit.call_args.args[3]['enhance_pdf'])
 
     def test_delete_completed_only_removes_successful_records_and_is_idempotent(self):
         ids = {}
@@ -140,7 +141,7 @@ class WebRecoveryTests(unittest.TestCase):
 
     def test_retry_reads_original_source_preserves_options_and_forces_pdf(self):
         source, job = self.add_local({'crop_top': 3, 'crop_bottom': 4, 'sample_interval': 0.5,
-                                      'remove_qr': True, 'mode': 'review'})
+                                      'remove_qr': True, 'enhance_pdf': True, 'mode': 'review'})
         old_output = self.root / 'jobs' / job['id'] / 'output'
         old_output.mkdir()
         (old_output / 'partial.png').write_bytes(b'keep this file')
@@ -153,6 +154,7 @@ class WebRecoveryTests(unittest.TestCase):
         options = submit.call_args.args[3]
         self.assertEqual((options['crop_top'], options['crop_bottom'], options['sample_interval']), (3, 4, 0.5))
         self.assertTrue(options['remove_qr'])
+        self.assertTrue(options['enhance_pdf'])
         self.assertEqual(options['mode'], 'auto')
         self.assertEqual((old_output / 'partial.png').read_bytes(), b'keep this file')
 

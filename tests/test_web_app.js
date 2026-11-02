@@ -29,6 +29,7 @@ async function run() {
   getElement("convert").disabled = true;
   getElement("sample-interval").value = "1";
   getElement("output-mode").value = "auto";
+  getElement("enhance-pdf").checked = true;
   for (const id of ["referer", "cookies-from-browser", "add-headers"]) getElement(id).value = "";
   const requests = [];
   const apiRequests = [];
@@ -213,6 +214,7 @@ async function run() {
     assert.equal(query.get("crop_top"), "4");
     assert.equal(query.get("crop_bottom"), "6");
     assert.equal(query.get("remove_qr"), "true");
+    assert.equal(query.get("enhance_pdf"), "true");
     assert.equal(query.get("sample_interval"), "1");
     assert.equal(query.get("mode"), "auto");
   }
@@ -318,6 +320,7 @@ async function run() {
   assert.deepEqual(sources.map((request) => request.body.kind), ["url", "local", "screenshots"]);
   assert.equal(sources[0].body.source, "https://example.com/video?a=1&b=2");
   assert.equal(sources[0].body.options.sample_interval, "0.5");
+  for (const request of sources) assert.equal(request.body.options.enhance_pdf, "true");
   assert.equal(sources[0].body.options.cookies_from_browser, "edge:Default");
   assert.deepEqual(sources[0].body.options.add_headers, ["User-Agent: Example", "Authorization: Bearer test"]);
   assert.equal(sources[1].body.options.referer, undefined);
